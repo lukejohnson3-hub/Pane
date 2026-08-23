@@ -1296,9 +1296,10 @@ export class TerminalPanelManager {
       if (data.includes('\r') || data.includes('\n')) {
         if (terminal.currentCommand.trim()) {
           terminal.commandHistory.push(terminal.currentCommand);
-          if (terminal.commandHistory.length > MAX_COMMAND_HISTORY) {
-            terminal.commandHistory.splice(0, terminal.commandHistory.length - MAX_COMMAND_HISTORY);
-          }
+          terminal.commandHistory.splice(
+            0,
+            Math.max(0, terminal.commandHistory.length - MAX_COMMAND_HISTORY),
+          );
 
           // Emit command executed event
           panelManager.emitPanelEvent(
