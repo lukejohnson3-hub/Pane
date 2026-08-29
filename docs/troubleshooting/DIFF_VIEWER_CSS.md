@@ -14,8 +14,8 @@ If the diff viewer content is cut off and scrollbars don't appear:
 ## The Solution That Works
 
 ```tsx
-// In ChangesTree.tsx - keep the tree's scroll owner simple.
-<div className="border border-t-0 border-gray-600 rounded-b-lg" style={{ overflow: 'auto', maxHeight: '600px' }}>
+// In CombinedDiffView.tsx - the panel is a flex column and ChangesTree owns scrolling.
+<div className="diff-panel flex min-w-0 flex-1 flex-col overflow-hidden">
   <ChangesTree manifest={manifest} {...treeProps} />
 </div>
 ```

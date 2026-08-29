@@ -73,6 +73,22 @@ describe('changes tree model', () => {
     expect(reconciled.has('d:collapsed')).toBe(false);
   });
 
+  it('keeps a re-compacted descendant collapsed beneath its prior collapsed ancestor', () => {
+    const previousTree = compactChains(buildChangesTree([
+      file('a/b/c/one.ts'),
+      file('a/b/d/two.ts'),
+    ]));
+    const previous = defaultExpanded(previousTree);
+    previous.delete('d:a/b');
+    expect(previous.has('d:a/b/c')).toBe(true);
+    const nextTree = compactChains(buildChangesTree([file('a/b/c/one.ts')]));
+
+    const reconciled = reconcileExpanded(previous, nextTree, previousTree);
+
+    expect(nextTree.children[0].id).toBe('d:a/b/c');
+    expect(reconciled.has('d:a/b/c')).toBe(false);
+  });
+
   it('implements every Left and Right navigation branch', () => {
     const tree = buildChangesTree([file('a/one.ts'), file('a/two.ts'), file('root.ts')]);
     const expanded = defaultExpanded(tree);

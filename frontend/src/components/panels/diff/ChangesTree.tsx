@@ -107,7 +107,11 @@ export const ChangesTree = memo(function ChangesTree({
       aria-activedescendant={rows[activeIndex] ? `${treeId}-r${activeIndex}` : undefined}
       className="pane-changes-tree min-h-0 flex-1 overflow-auto outline-none"
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
-      onFocus={() => { if (activePath) activate(Math.max(0, rows.findIndex(row => row.file?.path === activePath))); }}
+      onFocus={() => {
+        if (!activePath) return;
+        const index = rows.findIndex(row => row.file?.path === activePath);
+        if (index >= 0) activate(index);
+      }}
       onKeyDown={(event) => {
         if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
           event.preventDefault();
@@ -138,6 +142,7 @@ export const ChangesTree = memo(function ChangesTree({
           const active = index === activeIndex;
           const label = row.file ? accessibleFileLabel(row.file) : row.label;
           return (
+            // oxlint-disable-next-line jsx-a11y/click-events-have-key-events -- Keyboard interaction is delegated to the focusable tree container.
             <div
               id={`${treeId}-r${index}`}
               key={row.id}
@@ -153,7 +158,6 @@ export const ChangesTree = memo(function ChangesTree({
               style={{ top: index * ROW_HEIGHT, paddingLeft: row.depth * 16 + 8 }}
               title={row.file?.previousPath ? `${row.file.previousPath} → ${row.fullPath}` : row.fullPath}
               onClick={() => { activate(index); if (row.kind === 'folder') toggle(row.id); else if (row.file) onFileOpen(row.file, false); }}
-              onKeyDown={(event) => { if (event.key === 'Enter' && row.file) onFileOpen(row.file, false); }}
               onDoubleClick={() => { if (row.file) onFileOpen(row.file, true); }}
             >
               <span className="pane-changes-tree-twistie">{row.kind === 'folder' && <ChevronRight className={cn('h-3.5 w-3.5', expanded.has(row.id) && 'rotate-90')} />}</span>

@@ -18,6 +18,7 @@ const SIDEBAR_STORAGE_KEY = 'diff-panel-sidebar-width';
 const DEFAULT_SIDEBAR_WIDTH = 300;
 const MIN_SIDEBAR_WIDTH = 150;
 const MAX_SIDEBAR_WIDTH = 600;
+const SESSION_SCOPE: DiffScope = { kind: 'session' };
 
 export interface CombinedDiffViewHandle { refresh: () => void }
 
@@ -28,7 +29,10 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   isVisible = true,
 }, ref) {
   const [executions, setExecutions] = useState<ExecutionDiff[]>([]);
-  const [scope, setScope] = useState<DiffScope>({ kind: 'session' });
+  const [scopeState, setScopeState] = useState<{ sessionId: string; scope: DiffScope }>(() => ({
+    sessionId,
+    scope: SESSION_SCOPE,
+  }));
   const [manifest, setManifest] = useState<DiffManifest | null>(null);
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
   const [executionsLoading, setExecutionsLoading] = useState(false);
@@ -52,6 +56,10 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   const executionRequestId = useRef(0);
   const displayedKey = useRef<string | null>(null);
 
+  const scope = scopeState.sessionId === sessionId ? scopeState.scope : SESSION_SCOPE;
+  const setScope = useCallback((next: DiffScope) => {
+    setScopeState({ sessionId, scope: next });
+  }, [sessionId]);
   const key = `${sessionId}:${scopeKey(scope)}`;
   const expanded = expandedByScope[key] ?? new Set<string>();
   const visibleManifest = displayedKey.current === key ? manifest : null;
@@ -65,15 +73,20 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   });
 
   const refresh = useCallback(() => {
-    if (isMutableScope(scope)) manifestCache.current.delete(key);
+    const prefix = `${sessionId}:`;
+    for (const [cacheKey, cached] of manifestCache.current) {
+      if (cacheKey.startsWith(prefix) && isMutableScope(cached.scope)) {
+        manifestCache.current.delete(cacheKey);
+      }
+    }
     requestId.current += 1;
     setRefreshNonce(value => value + 1);
-  }, [key, scope]);
+  }, [sessionId]);
 
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
   useEffect(() => {
-    setScope({ kind: 'session' });
+    setScope(SESSION_SCOPE);
     setManifest(null);
     setExecutions([]);
     setExpandedByScope({});
@@ -85,7 +98,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     setLoadingKey(null);
     setMainBranch('main');
     setHistorySource(isMainRepo ? 'remote' : 'branch');
-  }, [isMainRepo, sessionId]);
+  }, [isMainRepo, sessionId, setScope]);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarWidth.toString());
@@ -118,12 +131,17 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     void API.sessions.getGitCommands(sessionId).then(response => {
+      if (cancelled) return;
       if (!response.success || !response.data) return;
       const branch = response.data.originBranch || response.data.comparisonBaseBranch || 'main';
       setMainBranch(branch);
       if (isMainRepo) setHistorySource(response.data.originBranch ? 'remote' : 'local');
-    }).catch(cause => console.error('Failed to load git commands:', cause));
+    }).catch(cause => {
+      if (!cancelled) console.error('Failed to load git commands:', cause);
+    });
+    return () => { cancelled = true; };
   }, [isMainRepo, sessionId]);
 
   useEffect(() => {
@@ -157,7 +175,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     };
     window.addEventListener('diff:view-commit', handler);
     return () => window.removeEventListener('diff:view-commit', handler);
-  }, [sessionId]);
+  }, [sessionId, setScope]);
 
   useEffect(() => {
     if (!isVisible) return;
@@ -231,7 +249,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     const olderHash = byId.get(olderId)?.after_commit_hash;
     const newerHash = byId.get(newerId)?.after_commit_hash;
     if (olderHash && newerHash) setScope({ kind: 'commit-range', olderHash, newerHash });
-  }, [executions]);
+  }, [executions, setScope]);
 
   const handleFileOpen = useCallback((file: ChangedFileSummary, pin: boolean) => {
     void openFileInEditor({ sessionId, filePath: file.path, pin, diff: editorDiffRefForFile(scope, file) });
@@ -298,7 +316,6 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
         </div>
       </div>
       <CommitDialog isOpen={showCommitDialog} onClose={() => setShowCommitDialog(false)} onCommit={handleCommit} fileCount={visibleManifest?.stats.filesChanged ?? 0} />
-      {isMainRepo && <span className="sr-only">Main repository changes</span>}
     </div>
   );
 }));

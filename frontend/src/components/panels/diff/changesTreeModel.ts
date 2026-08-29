@@ -99,7 +99,16 @@ export function reconcileExpanded(
 ): Set<string> {
   const current = new Set(folderIds(tree));
   const prior = new Set(previousTree ? folderIds(previousTree) : []);
-  return new Set([...current].filter(id => previous.has(id) || !prior.has(id)));
+  const collapsedPaths = [...prior]
+    .filter(id => !previous.has(id))
+    .map(id => id.slice(2));
+  return new Set([...current].filter(id => {
+    const path = id.slice(2);
+    const belowCollapsedAncestor = collapsedPaths.some(collapsed =>
+      path === collapsed || path.startsWith(`${collapsed}/`),
+    );
+    return !belowCollapsedAncestor && (previous.has(id) || !prior.has(id));
+  }));
 }
 
 export function flattenRows(tree: ChangesTreeNode, expanded: ReadonlySet<string>): TreeRow[] {

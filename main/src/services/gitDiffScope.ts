@@ -121,10 +121,11 @@ export function parseNumstatZ(output: string): NumstatRecord[] {
 export function parseWorkingTreeFilesZ(output: string): WorkingTreeFileRecords {
   const untracked: string[] = [];
   const unmerged = new Set<string>();
+  const stagePrefix = /^[0-7]{6} [0-9a-f]{40} [0-3]\t/;
   for (const record of nulParts(output)) {
-    const separator = record.indexOf('\t');
-    if (separator < 0) untracked.push(record);
-    else unmerged.add(record.slice(separator + 1));
+    const staged = stagePrefix.exec(record);
+    if (staged) unmerged.add(record.slice(staged[0].length));
+    else untracked.push(record);
   }
   return { untracked, unmerged: [...unmerged] };
 }

@@ -188,13 +188,15 @@ describe('GitDiffManager manifests', () => {
     commitPaths(cwd, 'main version', ['conflict.ts']);
     git(cwd, 'checkout', 'feature');
     expect(() => git(cwd, 'merge', 'main')).toThrow();
+    write(cwd, 'ta\tb.txt', 'untracked tab path\n');
     const { manager, runner, deps } = harness(cwd);
 
     const manifest = await manager.getDiffManifest(cwd, { kind: 'working-tree' }, runner, deps);
 
-    expect(manifest.files).toHaveLength(1);
-    expect(manifest.files[0]).toMatchObject({ path: 'conflict.ts', kind: 'unmerged' });
-    expect(manifest.stats.filesChanged).toBe(1);
+    expect(manifest.files).toHaveLength(2);
+    expect(manifest.files).toContainEqual(expect.objectContaining({ path: 'conflict.ts', kind: 'unmerged' }));
+    expect(manifest.files).toContainEqual(expect.objectContaining({ path: 'ta\tb.txt', kind: 'added' }));
+    expect(manifest.stats.filesChanged).toBe(2);
   });
 });
 
@@ -374,10 +376,12 @@ describe('NUL parsers', () => {
   });
 
   it('separates staged unmerged records from untracked paths', () => {
+    const firstHash = 'd'.repeat(40);
+    const secondHash = 'c'.repeat(40);
     expect(parseWorkingTreeFilesZ(
-      '100644 deadbeef 1\tconflict.ts\0'
-      + '100644 cafebabe 2\tconflict.ts\0'
-      + 'untracked.ts\0',
-    )).toEqual({ unmerged: ['conflict.ts'], untracked: ['untracked.ts'] });
+      `100644 ${firstHash} 1\tconflict.ts\0`
+      + `100644 ${secondHash} 2\tconflict.ts\0`
+      + 'ta\tb.txt\0',
+    )).toEqual({ unmerged: ['conflict.ts'], untracked: ['ta\tb.txt'] });
   });
 });

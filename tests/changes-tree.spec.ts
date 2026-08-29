@@ -234,6 +234,7 @@ test('cache ownership settles loading and refresh invalidates only mutable scope
   const hashB = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
   const commitA = createManifest({ kind: 'commit', hash: hashA }, [changed('commit-a.ts')]);
   const commitB = createManifest({ kind: 'commit', hash: hashB }, [changed('commit-b.ts')]);
+  const workingTree = createManifest({ kind: 'working-tree' }, [changed('uncommitted-cache.ts')]);
   const workingRange = createManifest({ kind: 'working-tree-range', baseHash: hashA }, [changed('range-working.ts')]);
   const executions = [
     execution(0, 'UNCOMMITTED', 'Uncommitted changes'),
@@ -244,6 +245,7 @@ test('cache ownership settles loading and refresh invalidates only mutable scope
     executions,
     manifests: {
       session: manifest,
+      'working-tree': workingTree,
       [`commit:${hashA}`]: commitA,
       [`commit:${hashB}`]: commitB,
       [`working-range:${hashA}`]: workingRange,
@@ -266,13 +268,19 @@ test('cache ownership settles loading and refresh invalidates only mutable scope
   await page.waitForTimeout(30);
   expect((await manifestCalls(page)).filter(call => call.scope.kind === 'commit' && call.scope.hash === hashA)).toHaveLength(1);
 
+  await page.getByRole('button', { name: 'Select uncommitted changes' }).click();
+  await expect(page.getByRole('treeitem', { name: 'Open diff for uncommitted-cache.ts' })).toBeVisible();
+  const sessionCallsBeforeRefresh = (await manifestCalls(page)).filter(call => call.scope.kind === 'session').length;
+  const workingTreeCallsBeforeRefresh = (await manifestCalls(page)).filter(call => call.scope.kind === 'working-tree').length;
+  await refresh.click();
+  await expect.poll(async () => (await manifestCalls(page)).filter(call => call.scope.kind === 'working-tree').length).toBe(workingTreeCallsBeforeRefresh + 1);
   await page.getByRole('button', { name: 'All changes' }).click();
   await expect(page.getByRole('treeitem', { name: 'Open diff for README.md' })).toBeVisible();
-  const sessionCallsBeforeRefresh = (await manifestCalls(page)).filter(call => call.scope.kind === 'session').length;
-  await refresh.click();
   await expect.poll(async () => (await manifestCalls(page)).filter(call => call.scope.kind === 'session').length).toBe(sessionCallsBeforeRefresh + 1);
 
   await page.getByRole('button', { name: 'Select Commit A' }).click();
+  await expect(page.getByRole('treeitem', { name: 'Open diff for commit-a.ts' })).toBeVisible();
+  expect((await manifestCalls(page)).filter(call => call.scope.kind === 'commit' && call.scope.hash === hashA)).toHaveLength(1);
   await page.getByRole('button', { name: 'Select uncommitted changes' }).click({ modifiers: ['Shift'] });
   await expect(page.getByRole('treeitem', { name: 'Open diff for range-working.ts' })).toBeVisible();
   const rangeCallsBeforeRefresh = (await manifestCalls(page)).filter(call => call.scope.kind === 'working-tree-range').length;
@@ -327,21 +335,28 @@ test('selection scopes and diff:view-commit handoff preserve legacy journeys', a
 
 test('switching sessions cannot show rows from the previous session', async ({ page }) => {
   const secondSession = { ...session, id: 'second-session', name: 'Second changes', worktreePath: '/tmp/tree-fixture/second', displayOrder: 1 };
+  const oldHash = '9999999999999999999999999999999999999999';
+  const oldCommit = createManifest({ kind: 'commit', hash: oldHash }, [changed('first-commit-only.ts')]);
   const secondManifest = createManifest({ kind: 'session' }, [changed('second-only.ts')]);
   await openTree(page, {
     sessions: [session, secondSession],
     panels: [...panels, ...panelsFor(secondSession)],
+    executions: [execution(1, oldHash, 'First session commit')],
     manifests: {
       [`${session.id}:session`]: manifest,
+      [`${session.id}:commit:${oldHash}`]: oldCommit,
       [`${secondSession.id}:session`]: secondManifest,
     },
   });
   await expect(page.getByRole('treeitem', { name: 'Open diff for README.md' })).toBeVisible();
+  await page.getByRole('button', { name: 'Select First session commit' }).click();
+  await expect(page.getByRole('treeitem', { name: 'Open diff for first-commit-only.ts' })).toBeVisible();
 
   await page.getByRole('button', { name: secondSession.name, exact: true }).click();
   await page.getByRole('tab', { name: 'Changes', exact: true }).click();
   await expect(page.getByRole('treeitem', { name: 'Open diff for second-only.ts' })).toBeVisible();
   await expect(page.getByRole('treeitem', { name: 'Open diff for README.md' })).toHaveCount(0);
+  expect((await manifestCalls(page)).filter(call => call.sessionId === secondSession.id && call.scope.kind === 'commit')).toHaveLength(0);
 });
 
 test('viewport matrix keeps basename and status visible without horizontal overflow', async ({ page }) => {
