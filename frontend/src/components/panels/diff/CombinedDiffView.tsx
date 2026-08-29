@@ -87,7 +87,13 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
 
   // Reveal the active file when it or the scope changes — not on every expansion change,
   // so a folder the user collapses around the open file stays collapsed.
+  // Focus returning to the tree reveals explicitly, bypassing that guard.
   const revealedFor = useRef<string | null>(null);
+  const revealActiveFile = useCallback(() => {
+    if (!activeDiffPath || !visible) return;
+    const revealed = revealPath(expanded, visible.tree, activeDiffPath);
+    if (revealed.size !== expanded.size) setExpandedByScope(previous => ({ ...previous, [key]: revealed }));
+  }, [activeDiffPath, expanded, key, visible]);
   useEffect(() => {
     if (!activeDiffPath || !visible) {
       revealedFor.current = null;
@@ -96,9 +102,8 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     const token = `${key}\0${activeDiffPath}`;
     if (revealedFor.current === token) return;
     revealedFor.current = token;
-    const revealed = revealPath(expanded, visible.tree, activeDiffPath);
-    if (revealed.size !== expanded.size) setExpandedByScope(previous => ({ ...previous, [key]: revealed }));
-  }, [activeDiffPath, expanded, key, visible]);
+    revealActiveFile();
+  }, [activeDiffPath, key, revealActiveFile, visible]);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarWidth.toString());
@@ -307,7 +312,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
             </div>
           ) : loading && !visibleManifest ? <div className="animate-pulse p-4 text-sm text-text-secondary">Loading {label}…</div>
             : error ? <div role="alert" className="m-4 rounded border border-status-error/30 bg-status-error/10 p-4 text-sm text-status-error">{error}</div>
-              : visible && visible.manifest.files.length > 0 ? <ChangesTree sessionId={sessionId} tree={visible.tree} scopeKey={scopeKey(scope)} activePath={activeDiffPath} expanded={expanded} onExpandedChange={next => setExpandedByScope(previous => ({ ...previous, [key]: next }))} onFileOpen={handleFileOpen} />
+              : visible && visible.manifest.files.length > 0 ? <ChangesTree sessionId={sessionId} tree={visible.tree} scopeKey={scopeKey(scope)} activePath={activeDiffPath} expanded={expanded} onExpandedChange={next => setExpandedByScope(previous => ({ ...previous, [key]: next }))} onRevealActive={revealActiveFile} onFileOpen={handleFileOpen} />
                 : <div className="flex h-full items-center justify-center text-sm text-text-secondary"><div className="space-y-2 text-center"><p>{emptyMessage}</p>{isMainRepo && historySource === 'remote' && <p className="text-sm text-text-tertiary">Create new commits to see them here.</p>}</div></div>}
         </div>
       </div>

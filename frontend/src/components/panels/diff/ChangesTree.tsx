@@ -26,6 +26,7 @@ export const ChangesTree = memo(function ChangesTree({
   activePath,
   expanded,
   onExpandedChange,
+  onRevealActive,
   onFileOpen,
 }: {
   sessionId: string;
@@ -34,6 +35,8 @@ export const ChangesTree = memo(function ChangesTree({
   activePath: string | null;
   expanded: ReadonlySet<string>;
   onExpandedChange: (expanded: Set<string>) => void;
+  /** Asks the owner to expand the active file's ancestors (focus returning to the tree). */
+  onRevealActive: () => void;
   onFileOpen: (file: ChangedFileSummary, pin: boolean) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -107,7 +110,7 @@ export const ChangesTree = memo(function ChangesTree({
       onFocus={() => {
         if (!activePath) return;
         const index = rows.findIndex(row => row.file?.path === activePath);
-        if (index >= 0) activate(index);
+        if (index >= 0) activate(index); else onRevealActive();
       }}
       onKeyDown={(event) => {
         if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
