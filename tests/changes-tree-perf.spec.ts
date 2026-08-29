@@ -50,16 +50,21 @@ test('5,000-file tree mounts only the viewport and reports paint timing', async 
     // only commits after it are the collapse, expand, and scroll interactions.
     const laterCommits = commits.filter(time => time > painted);
     const laterPaints = paints.filter(time => time > painted);
-    const interactionPaintsMs = laterCommits.map((commit, index) => Math.round(((laterPaints[index] ?? commit) - commit) * 10) / 10);
+    const interactionPaintsMs = laterCommits.length === laterPaints.length
+      ? laterCommits.map((commit, index) => Math.round((laterPaints[index] - commit) * 10) / 10)
+      : [];
     // SAFETY: The test's init script installs this measurement array before application code runs.
     const tasks = (window as typeof window & { __paneDiffLongTasks: Array<{ startTime: number; duration: number }> }).__paneDiffLongTasks;
     return {
+      paintCount: paints.length,
       receiptToPaintMs: painted - receipt,
       interactionPaintsMs,
       maxLongTaskMs: Math.max(0, ...tasks.filter(task => task.startTime >= receipt).map(task => task.duration)),
     };
   });
   console.log(JSON.stringify({ ...metrics, maxMountedRows }));
+  expect(metrics.paintCount).toBeGreaterThan(0);
+  expect(metrics.interactionPaintsMs).toHaveLength(2);
   if (process.env.PANE_DIFF_BENCH === '1') {
     expect(metrics.receiptToPaintMs).toBeLessThanOrEqual(200);
     expect(metrics.maxLongTaskMs).toBeLessThanOrEqual(50);

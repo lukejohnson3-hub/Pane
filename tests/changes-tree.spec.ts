@@ -416,3 +416,33 @@ test('a late commit manifest cannot replace a restored All changes scope', async
   await expect(page.getByRole('treeitem', { name: 'Open diff for README.md' })).toBeVisible();
   await expect(page.getByRole('treeitem', { name: 'Open diff for commit-only.ts' })).toHaveCount(0);
 });
+
+test('active file selection is scope-gated and a manual collapse around it sticks', async ({ page }) => {
+  const hashA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const commitA = createManifest({ kind: 'commit', hash: hashA }, [changed('src/components/Alpha.tsx')]);
+  await openTree(page, {
+    executions: [execution(1, hashA, 'Commit A')],
+    manifests: { session: manifest, [`commit:${hashA}`]: commitA },
+    fileDiffs: {
+      'session:src/components/Alpha.tsx': { file: manifest.files[0], patch: 'diff --git a/src/components/Alpha.tsx b/src/components/Alpha.tsx\n--- a/src/components/Alpha.tsx\n+++ b/src/components/Alpha.tsx\n@@ -1 +1 @@\n-alpha\n+alpha session\n', status: 'changed' },
+    },
+  });
+  const alpha = page.getByRole('treeitem', { name: 'Open diff for src/components/Alpha.tsx' });
+  const components = page.getByRole('treeitem', { name: 'components', exact: true });
+
+  await alpha.click();
+  await expect(page.getByRole('tab', { name: 'Alpha.tsx (All changes)' })).toHaveAttribute('aria-selected', 'true');
+  await expect(alpha).toHaveAttribute('aria-selected', 'true');
+
+  await components.click();
+  await expect(components).toHaveAttribute('aria-expanded', 'false');
+  await expect(alpha).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Select Commit A' }).click();
+  await expect(alpha).toBeVisible();
+  await expect(alpha).toHaveAttribute('aria-selected', 'false');
+
+  await page.getByRole('button', { name: 'All changes', exact: true }).click();
+  await expect(components).toHaveAttribute('aria-expanded', 'true');
+  await expect(alpha).toHaveAttribute('aria-selected', 'true');
+});

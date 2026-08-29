@@ -10,8 +10,10 @@ import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ, 
 
 const directories: string[] = [];
 // NTFS cannot represent tab or glob characters in file names, so Windows exercises
-// the same delimiter/literal-pathspec paths with the closest legal spellings; the
-// NUL parser tests below cover the tab-bearing records on every platform.
+// the same code paths with the closest legal spellings. The tab-bearing cases — a
+// stage-record-shaped untracked name and a tab-bearing untracked path — are proven
+// on POSIX through real git and on every platform by the mergeSummaries and NUL
+// parser unit tests below.
 const isWindows = process.platform === 'win32';
 const untrackedTabPath = isWindows ? 'ta b.txt' : 'ta\tb.txt';
 const literalGlobPath = isWindows ? '[isolated].txt' : '*isolated.txt';
@@ -442,6 +444,13 @@ describe('GitDiffManager file diffs', () => {
 });
 
 describe('NUL parsers', () => {
+  it('keeps a stage-record-shaped untracked name whole instead of parsing it as an unmerged record', () => {
+    const deceptive = `100644 ${'0'.repeat(40)} 1\tlooks-unmerged.txt`;
+    const files = mergeSummaries([], [], [deceptive]);
+    expect(files).toEqual([{ path: deceptive, kind: 'added', additions: null, deletions: null, isBinary: false }]);
+    expect(files.some(file => file.path === 'looks-unmerged.txt')).toBe(false);
+  });
+
   it('parses rename and binary records without path regexes', () => {
     const names = parseNameStatusZ('R100\0old name\0new name\0M\0[odd]?.bin\0');
     const stats = parseNumstatZ('1\t2\t\0old name\0new name\0-\t-\t[odd]?.bin\0');

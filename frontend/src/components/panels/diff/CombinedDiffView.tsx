@@ -85,8 +85,17 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
 
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
+  // Reveal the active file when it or the scope changes — not on every expansion change,
+  // so a folder the user collapses around the open file stays collapsed.
+  const revealedFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!activeDiffPath || !visible) return;
+    if (!activeDiffPath || !visible) {
+      revealedFor.current = null;
+      return;
+    }
+    const token = `${key}\0${activeDiffPath}`;
+    if (revealedFor.current === token) return;
+    revealedFor.current = token;
     const revealed = revealPath(expanded, visible.tree, activeDiffPath);
     if (revealed.size !== expanded.size) setExpandedByScope(previous => ({ ...previous, [key]: revealed }));
   }, [activeDiffPath, expanded, key, visible]);
