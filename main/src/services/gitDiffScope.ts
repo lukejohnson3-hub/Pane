@@ -67,11 +67,6 @@ export interface NumstatRecord {
   deletions: number | null;
 }
 
-export interface WorkingTreeFileRecords {
-  untracked: string[];
-  unmerged: string[];
-}
-
 const nulParts = (value: string): string[] => value.split('\0').filter((part, index, all) => part.length > 0 || index < all.length - 1);
 
 export function parseNameStatusZ(output: string): NameStatusRecord[] {
@@ -118,16 +113,27 @@ export function parseNumstatZ(output: string): NumstatRecord[] {
   return records;
 }
 
-export function parseWorkingTreeFilesZ(output: string): WorkingTreeFileRecords {
-  const untracked: string[] = [];
+const hasOnlyCharactersBetween = (value: string, lower: string, upper: string): boolean =>
+  [...value].every(character => character >= lower && character <= upper);
+
+const isHexObjectId = (value: string): boolean => value.length >= 40 && [...value].every(character => {
+  const lower = character.toLowerCase();
+  return (character >= '0' && character <= '9') || (lower >= 'a' && lower <= 'f');
+});
+
+export function parseUnmergedFilesZ(output: string): string[] {
   const unmerged = new Set<string>();
-  const stagePrefix = /^[0-7]{6} [0-9a-f]{40} [0-3]\t/;
   for (const record of nulParts(output)) {
-    const staged = stagePrefix.exec(record);
-    if (staged) unmerged.add(record.slice(staged[0].length));
-    else untracked.push(record);
+    const separator = record.indexOf('\t');
+    if (separator < 0) continue;
+    const fields = record.slice(0, separator).split(' ');
+    if (fields.length !== 3) continue;
+    const [mode, objectId, stage] = fields;
+    if (mode.length !== 6 || !hasOnlyCharactersBetween(mode, '0', '7')) continue;
+    if (!isHexObjectId(objectId) || (stage !== '1' && stage !== '2' && stage !== '3')) continue;
+    unmerged.add(record.slice(separator + 1));
   }
-  return { untracked, unmerged: [...unmerged] };
+  return [...unmerged];
 }
 
 export function changeKindFromStatus(status: string): ChangeKind {

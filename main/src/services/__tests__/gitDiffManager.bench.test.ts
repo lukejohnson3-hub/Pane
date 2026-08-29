@@ -52,7 +52,7 @@ describe.skipIf(!enabled)('git diff manifest benchmark', () => {
     const p95 = timings[Math.floor(timings.length * 0.95)];
     const gitProcessCount = (processCount - beforeWarmProcesses) / 20;
     process.stdout.write(`${JSON.stringify({ machine: hostname(), os: `${platform()} ${release()}`, git: git(cwd, '--version').trim(), coldMs: cold, p50Ms: p50, p95Ms: p95, gitProcessCount })}\n`);
-    expect(gitProcessCount).toBe(5);
+    expect(gitProcessCount).toBe(6);
     expect(p95).toBeLessThanOrEqual(1000);
   }, 120_000);
 });

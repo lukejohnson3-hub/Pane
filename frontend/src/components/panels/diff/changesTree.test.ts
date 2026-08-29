@@ -89,6 +89,23 @@ describe('changes tree model', () => {
     expect(reconciled.has('d:a/b/c')).toBe(false);
   });
 
+  it('preserves expanded descendants when their collapsed ancestor survives an identical refetch', () => {
+    const files = [
+      file('a/b/c/one.ts'),
+      file('a/b/c/two.ts'),
+      file('a/b/e/three.ts'),
+      file('a/x.ts'),
+    ];
+    const previousTree = compactChains(buildChangesTree(files));
+    const previous = defaultExpanded(previousTree);
+    previous.delete('d:a');
+    const nextTree = compactChains(buildChangesTree(files));
+
+    const reconciled = reconcileExpanded(previous, nextTree, previousTree);
+
+    expect([...reconciled].sort()).toEqual(['d:a/b', 'd:a/b/c', 'd:a/b/e']);
+  });
+
   it('implements every Left and Right navigation branch', () => {
     const tree = buildChangesTree([file('a/one.ts'), file('a/two.ts'), file('root.ts')]);
     const expanded = defaultExpanded(tree);

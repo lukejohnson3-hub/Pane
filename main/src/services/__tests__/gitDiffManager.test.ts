@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DiffManifest, FileDiffRequest } from '../../../../shared/types/gitDiff';
 import { CommandRunner } from '../../utils/commandRunner';
 import { GitDiffManager } from '../gitDiffManager';
-import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ, parseWorkingTreeFilesZ } from '../gitDiffScope';
+import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ, parseUnmergedFilesZ } from '../gitDiffScope';
 
 const directories: string[] = [];
 const git = (cwd: string, ...args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -94,7 +94,8 @@ describe('GitDiffManager manifests', () => {
   it('uses exactly the bounded metadata commands and never transfers an untracked body', async () => {
     const cwd = repository();
     const bodyMarker = 'UNTRACKED-BODY-MUST-NOT-BE-READ';
-    write(cwd, 'untracked-secret.txt', `${bodyMarker}\n`);
+    const deceptivePath = `100644 ${'0'.repeat(40)} 1\tlooks-unmerged.txt`;
+    write(cwd, deceptivePath, `${bodyMarker}\n`);
     const { manager, runner, deps } = harness(cwd);
     const mergeBase = git(cwd, 'merge-base', 'main', 'HEAD').trim();
     const outputs: string[] = [];
@@ -108,19 +109,22 @@ describe('GitDiffManager manifests', () => {
     const manifest = await manager.getDiffManifest(cwd, { kind: 'session' }, runner, deps);
     const invocations = execFile.mock.calls.map(([file, args]) => [file, [...args]]);
 
-    expect(sortedPaths(manifest)).toEqual(['untracked-secret.txt']);
+    expect(sortedPaths(manifest)).toEqual([deceptivePath]);
+    expect(manifest.files[0].kind).toBe('added');
+    expect(manifest.files.some(file => file.path === 'looks-unmerged.txt')).toBe(false);
     expect(invocations).toEqual([
       ['git', ['merge-base', '--end-of-options', 'main', 'HEAD']],
       ['git', ['rev-parse', '--verify', '--end-of-options', 'HEAD']],
       ['git', ['diff', '-z', '-M', '--name-status', mergeBase, '--']],
       ['git', ['diff', '-z', '-M', '--numstat', mergeBase, '--']],
-      ['git', ['ls-files', '-z', '--others', '--exclude-standard', '--unmerged', '--stage']],
+      ['git', ['ls-files', '-z', '--others', '--exclude-standard']],
+      ['git', ['ls-files', '-z', '--unmerged']],
     ]);
     expect(outputs.join('\n')).not.toContain(bodyMarker);
     expect(invocations.flat(2)).not.toContain('cat');
     expect(invocations.flat(2)).not.toContain('wc');
     expect(invocations.flat(2)).not.toContain('show');
-    expect(invocations.flat(2)).not.toContain('untracked-secret.txt');
+    expect(invocations.flat(2)).not.toContain(deceptivePath);
   });
 
   it('uses a commit parent, a merge first parent, and the empty tree for a root commit', async () => {
@@ -375,13 +379,47 @@ describe('NUL parsers', () => {
     }]);
   });
 
-  it('separates staged unmerged records from untracked paths', () => {
+  it('parses SHA-1 and SHA-256 unmerged stage records without a fixed object-id width', () => {
     const firstHash = 'd'.repeat(40);
-    const secondHash = 'c'.repeat(40);
-    expect(parseWorkingTreeFilesZ(
+    const secondHash = 'c'.repeat(64);
+    expect(parseUnmergedFilesZ(
       `100644 ${firstHash} 1\tconflict.ts\0`
       + `100644 ${secondHash} 2\tconflict.ts\0`
       + 'ta\tb.txt\0',
-    )).toEqual({ unmerged: ['conflict.ts'], untracked: ['ta\tb.txt'] });
+    )).toEqual(['conflict.ts']);
+  });
+
+  it('parses unmerged records from a SHA-256 repository when supported', async (context) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pane-git-diff-sha256-'));
+    directories.push(cwd);
+    try {
+      git(cwd, 'init', '--object-format=sha256', '-b', 'main');
+    } catch {
+      context.skip();
+      return;
+    }
+    git(cwd, 'config', 'user.name', 'Pane Test');
+    git(cwd, 'config', 'user.email', 'pane@example.test');
+    write(cwd, 'conflict.ts', 'base\n');
+    commitPaths(cwd, 'base', ['conflict.ts']);
+    git(cwd, 'checkout', '-b', 'feature');
+    write(cwd, 'conflict.ts', 'feature\n');
+    commitPaths(cwd, 'feature', ['conflict.ts']);
+    git(cwd, 'checkout', 'main');
+    write(cwd, 'conflict.ts', 'main\n');
+    commitPaths(cwd, 'main', ['conflict.ts']);
+    git(cwd, 'checkout', 'feature');
+    expect(() => git(cwd, 'merge', 'main')).toThrow();
+
+    const output = git(cwd, 'ls-files', '-z', '--unmerged');
+    const firstObjectId = output.split('\0')[0].split('\t')[0].split(' ')[1];
+    expect(firstObjectId).toHaveLength(64);
+    expect(parseUnmergedFilesZ(output)).toEqual(['conflict.ts']);
+
+    const { manager, runner, deps } = harness(cwd);
+    const manifest = await manager.getDiffManifest(cwd, { kind: 'working-tree' }, runner, deps);
+    expect(manifest.files.filter(file => file.path === 'conflict.ts')).toEqual([
+      expect.objectContaining({ kind: 'unmerged' }),
+    ]);
   });
 });

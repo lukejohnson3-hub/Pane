@@ -14,7 +14,7 @@ import {
   mergeSummaries,
   parseNameStatusZ,
   parseNumstatZ,
-  parseWorkingTreeFilesZ,
+  parseUnmergedFilesZ,
   resolveScope,
   type ScopeResolutionDependencies,
 } from './gitDiffScope';
@@ -110,21 +110,23 @@ export class GitDiffManager {
       ? [baseHash]
       : [baseHash, resolved.target.hash ?? ''];
     const env = { LC_ALL: 'C' };
-    const [names, stats, untracked] = await Promise.all([
+    const [names, stats, untracked, unmerged] = await Promise.all([
       runner.execFile('git', ['diff', '-z', '-M', '--name-status', ...range, '--'], worktreePath, { env, silent: true }),
       runner.execFile('git', ['diff', '-z', '-M', '--numstat', ...range, '--'], worktreePath, { env, silent: true }),
       resolved.target.kind === 'working-tree'
-        ? runner.execFile('git', ['ls-files', '-z', '--others', '--exclude-standard', '--unmerged', '--stage'], worktreePath, { env, silent: true })
+        ? runner.execFile('git', ['ls-files', '-z', '--others', '--exclude-standard'], worktreePath, { env, silent: true })
+        : Promise.resolve({ stdout: '', stderr: '', exitCode: 0 }),
+      resolved.target.kind === 'working-tree'
+        ? runner.execFile('git', ['ls-files', '-z', '--unmerged'], worktreePath, { env, silent: true })
         : Promise.resolve({ stdout: '', stderr: '', exitCode: 0 }),
     ]);
-    const workingTreeFiles = parseWorkingTreeFilesZ(untracked.stdout);
     const files = mergeSummaries(
       [
         ...parseNameStatusZ(names.stdout),
-        ...workingTreeFiles.unmerged.map(path => ({ status: 'U', path })),
+        ...parseUnmergedFilesZ(unmerged.stdout).map(path => ({ status: 'U', path })),
       ],
       parseNumstatZ(stats.stdout),
-      workingTreeFiles.untracked,
+      untracked.stdout.split('\0').filter(Boolean),
     );
     return {
       scope,

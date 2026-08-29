@@ -100,7 +100,7 @@ export function reconcileExpanded(
   const current = new Set(folderIds(tree));
   const prior = new Set(previousTree ? folderIds(previousTree) : []);
   const collapsedPaths = [...prior]
-    .filter(id => !previous.has(id))
+    .filter(id => !previous.has(id) && !current.has(id))
     .map(id => id.slice(2));
   return new Set([...current].filter(id => {
     const path = id.slice(2);
