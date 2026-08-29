@@ -40,11 +40,20 @@ test('5,000-file tree mounts only the viewport and reports paint timing', async 
   await page.waitForTimeout(50);
   const maxMountedRows = Math.max(mountedRows, await tree.getByRole('treeitem').count());
   const metrics = await page.evaluate(() => {
+    // Receipt-to-paint is the first painted frame after the last manifest receipt; later
+    // committed/painted pairs belong to the collapse, expand, and scroll interactions above.
     const receipt = performance.getEntriesByName('pane-diff-manifest-received').at(-1)?.startTime ?? 0;
-    const painted = performance.getEntriesByName('pane-diff-tree-painted').at(-1)?.startTime ?? receipt;
+    const paints = performance.getEntriesByName('pane-diff-tree-painted').map(entry => entry.startTime).filter(time => time >= receipt);
+    const commits = performance.getEntriesByName('pane-diff-tree-committed').map(entry => entry.startTime).filter(time => time >= receipt);
+    const painted = paints[0] ?? receipt;
+    const interactionPaintsMs = commits.slice(1).map((commit, index) => Math.round(((paints[index + 1] ?? commit) - commit) * 10) / 10);
     // SAFETY: The test's init script installs this measurement array before application code runs.
     const tasks = (window as typeof window & { __paneDiffLongTasks: Array<{ startTime: number; duration: number }> }).__paneDiffLongTasks;
-    return { receiptToPaintMs: painted - receipt, maxLongTaskMs: Math.max(0, ...tasks.filter(task => task.startTime >= receipt).map(task => task.duration)) };
+    return {
+      receiptToPaintMs: painted - receipt,
+      interactionPaintsMs,
+      maxLongTaskMs: Math.max(0, ...tasks.filter(task => task.startTime >= receipt).map(task => task.duration)),
+    };
   });
   console.log(JSON.stringify({ ...metrics, maxMountedRows }));
   if (process.env.PANE_DIFF_BENCH === '1') {

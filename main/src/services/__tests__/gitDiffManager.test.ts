@@ -9,6 +9,12 @@ import { GitDiffManager } from '../gitDiffManager';
 import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ, parseUnmergedFilesZ } from '../gitDiffScope';
 
 const directories: string[] = [];
+// NTFS cannot represent tab or glob characters in file names, so Windows exercises
+// the same delimiter/literal-pathspec paths with the closest legal spellings; the
+// NUL parser tests below cover the tab-bearing records on every platform.
+const isWindows = process.platform === 'win32';
+const untrackedTabPath = isWindows ? 'ta b.txt' : 'ta\tb.txt';
+const literalGlobPath = isWindows ? '[isolated].txt' : '*isolated.txt';
 const git = (cwd: string, ...args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf8' });
 const head = (cwd: string): string => git(cwd, 'rev-parse', 'HEAD').trim();
 const sortedPaths = (manifest: DiffManifest): string[] => manifest.files.map(file => file.path).sort();
@@ -94,7 +100,7 @@ describe('GitDiffManager manifests', () => {
   it('uses exactly the bounded metadata commands and never transfers an untracked body', async () => {
     const cwd = repository();
     const bodyMarker = 'UNTRACKED-BODY-MUST-NOT-BE-READ';
-    const deceptivePath = `100644 ${'0'.repeat(40)} 1\tlooks-unmerged.txt`;
+    const deceptivePath = `100644 ${'0'.repeat(40)} 1${isWindows ? ' ' : '\t'}looks-unmerged.txt`;
     write(cwd, deceptivePath, `${bodyMarker}\n`);
     const { manager, runner, deps } = harness(cwd);
     const mergeBase = git(cwd, 'merge-base', 'main', 'HEAD').trim();
@@ -231,14 +237,14 @@ describe('GitDiffManager manifests', () => {
     commitPaths(cwd, 'main version', ['conflict.ts']);
     git(cwd, 'checkout', 'feature');
     expect(() => git(cwd, 'merge', 'main')).toThrow();
-    write(cwd, 'ta\tb.txt', 'untracked tab path\n');
+    write(cwd, untrackedTabPath, 'untracked tab path\n');
     const { manager, runner, deps } = harness(cwd);
 
     const manifest = await manager.getDiffManifest(cwd, { kind: 'working-tree' }, runner, deps);
 
     expect(manifest.files).toHaveLength(2);
     expect(manifest.files).toContainEqual(expect.objectContaining({ path: 'conflict.ts', kind: 'unmerged' }));
-    expect(manifest.files).toContainEqual(expect.objectContaining({ path: 'ta\tb.txt', kind: 'added' }));
+    expect(manifest.files).toContainEqual(expect.objectContaining({ path: untrackedTabPath, kind: 'added' }));
     expect(manifest.stats.filesChanged).toBe(2);
   });
 });
@@ -268,7 +274,7 @@ describe('GitDiffManager file diffs', () => {
     write(cwd, 'rename-edit-new.txt', 'one\ntwo changed\nthree\nfour\n');
     write(cwd, 'binary.bin', Buffer.from([0, 9, 8, 7]));
     write(cwd, 'untracked.txt', 'untracked patch\n');
-    write(cwd, '*isolated.txt', 'literal star\n');
+    write(cwd, literalGlobPath, 'literal glob\n');
     const { manager, runner, deps } = harness(cwd);
     const execFile = vi.spyOn(runner, 'execFile');
     const load = (request: FileDiffRequest) => manager.getFileDiff(cwd, { kind: 'working-tree' }, request, runner, deps);
@@ -323,13 +329,13 @@ describe('GitDiffManager file diffs', () => {
       'diff', '--no-index', '--no-color', '--', '/dev/null', 'untracked.txt',
     ]);
 
-    const literalStar = await load({ path: '*isolated.txt' });
-    expect(literalStar).toMatchObject({ status: 'changed', file: { path: '*isolated.txt', kind: 'added' } });
-    expect(literalStar.patch).toContain('*isolated.txt');
-    expect(literalStar.patch).not.toContain('modified.txt');
-    expect(literalStar.patch).not.toContain('untracked.txt');
+    const literalGlob = await load({ path: literalGlobPath });
+    expect(literalGlob).toMatchObject({ status: 'changed', file: { path: literalGlobPath, kind: 'added' } });
+    expect(literalGlob.patch).toContain(literalGlobPath);
+    expect(literalGlob.patch).not.toContain('modified.txt');
+    expect(literalGlob.patch).not.toContain('untracked.txt');
     expect(execFile.mock.calls.map(([, args]) => [...args])).toContainEqual([
-      'diff', '--no-index', '--no-color', '--', '/dev/null', '*isolated.txt',
+      'diff', '--no-index', '--no-color', '--', '/dev/null', literalGlobPath,
     ]);
   });
 
