@@ -46,7 +46,11 @@ test('5,000-file tree mounts only the viewport and reports paint timing', async 
     const paints = performance.getEntriesByName('pane-diff-tree-painted').map(entry => entry.startTime).filter(time => time >= receipt);
     const commits = performance.getEntriesByName('pane-diff-tree-committed').map(entry => entry.startTime).filter(time => time >= receipt);
     const painted = paints[0] ?? receipt;
-    const interactionPaintsMs = commits.slice(1).map((commit, index) => Math.round(((paints[index + 1] ?? commit) - commit) * 10) / 10);
+    // Commits before the first paint are the initial mount (StrictMode runs that layout effect twice);
+    // only commits after it are the collapse, expand, and scroll interactions.
+    const laterCommits = commits.filter(time => time > painted);
+    const laterPaints = paints.filter(time => time > painted);
+    const interactionPaintsMs = laterCommits.map((commit, index) => Math.round(((laterPaints[index] ?? commit) - commit) * 10) / 10);
     // SAFETY: The test's init script installs this measurement array before application code runs.
     const tasks = (window as typeof window & { __paneDiffLongTasks: Array<{ startTime: number; duration: number }> }).__paneDiffLongTasks;
     return {
