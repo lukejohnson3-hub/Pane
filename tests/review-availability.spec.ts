@@ -127,7 +127,18 @@ async function openSession(
     initialSessions: [createSession(gitStatus)],
     initialPanels: options.initialPanels ?? panels,
     initialExecutions: options.withLocalChanges === false ? [] : localExecutions,
-    initialCombinedDiff: options.withLocalChanges === false ? null : localCombinedDiff,
+    diffManifests: {
+      session: {
+        scope: { kind: 'session' },
+        files: options.withLocalChanges === false ? [] : [{ path: 'src/review.ts', kind: 'modified', additions: 8, deletions: 3, isBinary: false }],
+        resolvedBase: { kind: 'comparison-base', ref: 'main', hash: '1111111111111111111111111111111111111111' },
+        resolvedTarget: { kind: 'working-tree' },
+        stats: options.withLocalChanges === false ? { additions: 0, deletions: 0, filesChanged: 0 } : localCombinedDiff.stats,
+      },
+    },
+    fileDiffs: options.withLocalChanges === false ? {} : {
+      'session:src/review.ts': { file: { path: 'src/review.ts', kind: 'modified', additions: 8, deletions: 3, isBinary: false }, patch: localCombinedDiff.diff, status: 'changed' },
+    },
     activeProjectId: project.id,
     initialConfig: options.initialConfig,
   });
@@ -267,14 +278,14 @@ test('Review stays local until a newly discovered pull request is explicitly ope
   await expect(localMode).toHaveAttribute('aria-pressed', 'true');
   await expect(localMode).toHaveClass(/bg-interactive/);
   await expect(page.getByText('Local changes', { exact: true })).toBeVisible();
-  const diffSummary = page.locator('.combined-diff-view').getByText('Changes', { exact: true }).locator('..');
+  const diffSummary = page.locator('.combined-diff-view').getByText(/^All changes/).locator('..');
   await expect(diffSummary.getByText('+8', { exact: true })).toBeVisible();
   await expect(diffSummary.getByText('-3', { exact: true })).toBeVisible();
 
   // Files in Changes open as center diff tabs (preview on single-click), not inline.
-  const reviewFile = page.getByRole('button', { name: 'Open diff for src/review.ts', exact: true });
+  const reviewFile = page.getByRole('treeitem', { name: 'Open diff for src/review.ts', exact: true });
   await reviewFile.click();
-  const diffTab = page.getByRole('tab', { name: 'review.ts (Changes)', exact: true });
+  const diffTab = page.getByRole('tab', { name: 'review.ts (All changes)', exact: true });
   await expect(diffTab).toHaveAttribute('aria-selected', 'true');
   await expect(reviewFile).toHaveAttribute('aria-current', 'true');
   const splitMode = page.getByRole('button', { name: 'Split', exact: true });

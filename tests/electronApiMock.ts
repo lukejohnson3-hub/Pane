@@ -11,6 +11,7 @@ import type {
 } from '../shared/types/remoteDaemon';
 import type { SubmitFeedbackRequest } from '../shared/types/feedback';
 import type { JsonObject, JsonValue } from '../shared/validation/boundaryDecoder';
+import type { DiffManifest, DiffScope, FileDiffResult } from '../shared/types/gitDiff';
 
 type MockEventValue = JsonValue | object | undefined;
 type MockEventCallback = (...args: MockEventValue[]) => void;
@@ -44,7 +45,12 @@ type ElectronApiMockOptions = {
     repositoriesSectionExpanded: boolean;
   }>;
   initialExecutions?: JsonObject[];
-  initialCombinedDiff?: JsonObject | null;
+  diffManifests?: Record<string, DiffManifest>;
+  fileDiffs?: Record<string, FileDiffResult>;
+  diffManifestDelayMs?: Record<string, number>;
+  fileDiffDelayMs?: Record<string, number>;
+  diffManifestErrors?: Record<string, string>;
+  fileDiffErrors?: Record<string, string>;
   /** Seeded split layout for the session under test (panels:get-layout). */
   initialLayout?: JsonObject | null;
   initialTerminalStates?: Record<string, JsonObject>;
@@ -78,6 +84,12 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
     const feedbackSubmissions: SubmitFeedbackRequest[] = [];
     const openedExternalUrls: string[] = [];
     const clone = <T>(value: T): T => structuredClone(value);
+    const scopeMockKey = (scope: DiffScope): string => {
+      if (scope.kind === 'commit') return `commit:${scope.hash}`;
+      if (scope.kind === 'commit-range') return `range:${scope.olderHash}:${scope.newerHash}`;
+      if (scope.kind === 'working-tree-range') return `working-range:${scope.baseHash}`;
+      return scope.kind;
+    };
     interface MockPreferences {
       [key: string]: string;
     }
@@ -707,7 +719,33 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         getArchivedWithProjects: () => success([]),
         getResumable: () => success([]),
         getExecutions: () => success(clone(mockOptions.initialExecutions ?? [])),
-        getCombinedDiff: () => success(clone(mockOptions.initialCombinedDiff ?? null)),
+        getDiffManifest: async (_sessionId: string, scope: DiffScope) => {
+          const key = scopeMockKey(scope);
+          const delay = mockOptions.diffManifestDelayMs?.[key] ?? 0;
+          if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+          performance.mark('pane-diff-manifest-received');
+          const failure = mockOptions.diffManifestErrors?.[key];
+          if (failure) return { success: false as const, error: failure };
+          const explicit = mockOptions.diffManifests?.[key];
+          if (explicit) return success(clone(explicit));
+          return success({
+            scope,
+            files: [],
+            resolvedBase: { kind: 'comparison-base' as const, ref: 'main', hash: '1111111111111111111111111111111111111111' },
+            resolvedTarget: { kind: 'working-tree' as const },
+            stats: { additions: 0, deletions: 0, filesChanged: 0 },
+          });
+        },
+        getFileDiff: async (_sessionId: string, scope: DiffScope, request: { path: string }) => {
+          const key = `${scopeMockKey(scope)}:${request.path}`;
+          const delay = mockOptions.fileDiffDelayMs?.[key] ?? 0;
+          if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+          const failure = mockOptions.fileDiffErrors?.[key];
+          if (failure) return { success: false as const, error: failure };
+          const explicit = mockOptions.fileDiffs?.[key];
+          if (explicit) return success(clone(explicit));
+          return success({ file: { path: request.path, kind: 'modified' as const, additions: null, deletions: null, isBinary: false }, patch: '', status: 'no-longer-changed' as const });
+        },
       }),
       remoteDaemon: namespace({
         getConfig: () => success(clone(remoteDaemonConfig)),
