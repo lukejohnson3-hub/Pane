@@ -14,6 +14,7 @@ export interface ResolvedScope {
 export interface ScopeResolutionDependencies {
   revParse(ref: string): Promise<string>;
   parents(hash: string): Promise<string[]>;
+  emptyTree(): Promise<string>;
   mergeBase(ref: string, target: string): Promise<string | null>;
   comparisonBase(): Promise<string>;
 }
@@ -22,7 +23,9 @@ const commitEndpoint = (hash: string): ResolvedDiffEndpoint => ({ kind: 'commit'
 
 async function parentOrEmpty(hash: string, deps: ScopeResolutionDependencies): Promise<ResolvedDiffEndpoint> {
   const parents = await deps.parents(hash);
-  return parents[0] ? commitEndpoint(parents[0]) : { kind: 'empty-tree', hash: EMPTY_TREE_HASH };
+  if (parents[0]) return commitEndpoint(parents[0]);
+  const emptyTreeHash = hash.length === EMPTY_TREE_HASH.length ? EMPTY_TREE_HASH : await deps.emptyTree();
+  return { kind: 'empty-tree', hash: emptyTreeHash };
 }
 
 export async function resolveScope(scope: DiffScope, deps: ScopeResolutionDependencies): Promise<ResolvedScope> {

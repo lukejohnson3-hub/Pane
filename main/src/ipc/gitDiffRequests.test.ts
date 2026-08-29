@@ -81,6 +81,8 @@ describe('git diff request boundary', () => {
 
   it('validates hashes and file requests', () => {
     expect(isHexHash('abcdef012345')).toBe(true);
+    expect(isHexHash('a'.repeat(64))).toBe(true);
+    expect(isHexHash('a'.repeat(65))).toBe(false);
     expect(isHexHash('not-a-hash')).toBe(false);
     expect(decodeBoundary({ path: '[literal]*.ts', previousPath: 'old.ts' }, fileDiffRequestSchema)).toEqual({ path: '[literal]*.ts', previousPath: 'old.ts' });
   });
@@ -110,6 +112,57 @@ describe('git diff registry handlers', () => {
     expect(getSessionComparisonBranch).toHaveBeenCalledTimes(2);
     expect(getSessionComparisonBranch).toHaveBeenNthCalledWith(1, session, context);
     expect(getSessionComparisonBranch).toHaveBeenNthCalledWith(2, session, context);
+  });
+
+  it('serves SHA-256 commit, root, and commit-range scopes when supported', async (context) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pane-git-diff-ipc-sha256-'));
+    directories.push(cwd);
+    try {
+      git(cwd, 'init', '--object-format=sha256', '-b', 'main');
+    } catch {
+      context.skip();
+      return;
+    }
+    git(cwd, 'config', 'user.name', 'Pane Test');
+    git(cwd, 'config', 'user.email', 'pane@example.test');
+    writeFileSync(join(cwd, 'root.txt'), 'root\n');
+    git(cwd, 'add', '--', 'root.txt');
+    git(cwd, 'commit', '-m', 'root');
+    const root = git(cwd, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(cwd, 'child.txt'), 'child\n');
+    git(cwd, 'add', '--', 'child.txt');
+    git(cwd, 'commit', '-m', 'child');
+    const child = git(cwd, 'rev-parse', 'HEAD').trim();
+    writeFileSync(join(cwd, 'newest.txt'), 'newest\n');
+    git(cwd, 'add', '--', 'newest.txt');
+    git(cwd, 'commit', '-m', 'newest');
+    const newest = git(cwd, 'rev-parse', 'HEAD').trim();
+    const emptyTree = git(cwd, 'hash-object', '-t', 'tree', '/dev/null').trim();
+    const { registry, session } = registeredHarness(cwd);
+
+    const commitResponse = await registry.invoke('sessions:get-diff-manifest', [
+      session.id,
+      { kind: 'commit', hash: child },
+    ]);
+    const rootResponse = await registry.invoke('sessions:get-diff-manifest', [
+      session.id,
+      { kind: 'commit', hash: root },
+    ]);
+    const rangeResponse = await registry.invoke('sessions:get-diff-manifest', [
+      session.id,
+      { kind: 'commit-range', olderHash: child, newerHash: newest },
+    ]);
+
+    expect(root).toHaveLength(64);
+    expect(commitResponse).toMatchObject({ success: true, data: { files: [{ path: 'child.txt' }] } });
+    expect(rootResponse).toMatchObject({
+      success: true,
+      data: { files: [{ path: 'root.txt' }], resolvedBase: { kind: 'empty-tree', hash: emptyTree } },
+    });
+    expect(rangeResponse).toMatchObject({
+      success: true,
+      data: { files: [{ path: 'child.txt' }, { path: 'newest.txt' }], resolvedBase: { hash: root } },
+    });
   });
 
   it.each([

@@ -1,7 +1,8 @@
 import type { Logger } from '../utils/logger';
 import type { AnalyticsManager } from './analyticsManager';
 import { CommandRunner } from '../utils/commandRunner';
-import { stat } from 'fs/promises';
+import type { ExecFileAsyncOptions, ExecFileResult } from '../utils/commandExecutor';
+import * as fs from 'fs/promises';
 import { isAbsolute } from 'path';
 import type {
   DiffManifest,
@@ -64,10 +65,13 @@ export interface GitDiffDependencies {
   comparisonBase(): Promise<string>;
 }
 
+const DEFAULT_DIFF_MAX_BUFFER = 50 * 1024 * 1024;
+
 export class GitDiffManager {
   constructor(
     private logger?: Logger,
-    private analyticsManager?: AnalyticsManager
+    private analyticsManager?: AnalyticsManager,
+    private readonly maxDiffBuffer = DEFAULT_DIFF_MAX_BUFFER,
   ) {}
 
   private scopeDependencies(
@@ -89,6 +93,10 @@ export class GitDiffManager {
       parents: async hash => {
         const result = await runner.execFile('git', ['rev-list', '--parents', '-n', '1', hash], worktreePath, { env, silent: true });
         return result.stdout.trim().split(/\s+/).slice(1);
+      },
+      emptyTree: async () => {
+        const result = await runner.execFile('git', ['hash-object', '-t', 'tree', '/dev/null'], worktreePath, { env, silent: true });
+        return result.stdout.trim();
       },
       mergeBase: async (ref, target) => {
         const result = await runner.execFile('git', ['merge-base', '--end-of-options', ref, target], worktreePath, { env, silent: true, okExitCodes: [1] });
@@ -151,7 +159,7 @@ export class GitDiffManager {
     this.validateDiffPath(request.path);
     if (request.previousPath) this.validateDiffPath(request.previousPath);
     try {
-      const info = await stat(`${worktreePath}/${request.path}`);
+      const info = await fs.lstat(`${worktreePath}/${request.path}`);
       if (info.isDirectory()) throw new DiffRequestError('invalid-path', 'Diff path cannot be a directory');
     } catch (error) {
       if (error instanceof DiffRequestError) throw error;
@@ -163,7 +171,7 @@ export class GitDiffManager {
     const range = resolved.target.kind === 'working-tree'
       ? [baseHash]
       : [baseHash, resolved.target.hash ?? ''];
-    const options = { env: { LC_ALL: 'C', GIT_LITERAL_PATHSPECS: '1' }, silent: true, maxBuffer: 50 * 1024 * 1024 };
+    const options = { env: { LC_ALL: 'C', GIT_LITERAL_PATHSPECS: '1' }, silent: true, maxBuffer: this.maxDiffBuffer };
     let validatedPreviousPath: string | undefined;
     let validatedNamesOutput: string | undefined;
     if (request.previousPath) {
@@ -185,15 +193,12 @@ export class GitDiffManager {
       }
     }
     const paths = validatedPreviousPath ? [request.path, validatedPreviousPath] : [request.path];
-    let patch: string;
-    try {
-      patch = (await runner.execFile('git', ['diff', '-M', '--no-color', ...range, '--', ...paths], worktreePath, options)).stdout;
-    } catch (cause: unknown) {
-      // SAFETY: CommandExecutor preserves Node's string overflow code on execFile errors.
-      const error = cause as { code?: string };
-      if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw new DiffRequestError('diff-too-large', 'File diff exceeds 50 MiB');
-      throw cause;
-    }
+    let patch = (await this.executePatch(
+      runner,
+      ['diff', '-M', '--no-color', ...range, '--', ...paths],
+      worktreePath,
+      options,
+    )).stdout;
 
     const [names, stats] = await Promise.all([
       validatedNamesOutput === undefined
@@ -207,19 +212,24 @@ export class GitDiffManager {
       const listed = await runner.execFile('git', ['ls-files', '-z', '--others', '--exclude-standard', '--', request.path], worktreePath, options);
       const isUntracked = listed.stdout.split('\0').includes(request.path);
       if (isUntracked) {
-        const result = await runner.execFile('git', ['diff', '--no-index', '--no-color', '--', '/dev/null', request.path], worktreePath, { ...options, okExitCodes: [0, 1] });
-        if (result.stdout.startsWith('diff --git')) {
-          patch = result.stdout;
+        const untrackedResult = await this.executePatch(
+          runner,
+          ['diff', '--no-index', '--no-color', '--', '/dev/null', request.path],
+          worktreePath,
+          { ...options, okExitCodes: [0, 1] },
+        );
+        if (untrackedResult.stdout.startsWith('diff --git')) {
+          patch = untrackedResult.stdout;
           files = [{ path: request.path, kind: 'added', additions: null, deletions: null, isBinary: patch.includes('Binary files') }];
         } else {
           try {
-            const info = await stat(`${worktreePath}/${request.path}`);
+            const info = await fs.lstat(`${worktreePath}/${request.path}`);
             if (info.isDirectory()) throw new DiffRequestError('invalid-path', 'Diff path cannot be a directory');
           } catch (error) {
             if (error instanceof DiffRequestError) throw error;
             return { file: { path: request.path, kind: 'added', additions: null, deletions: null, isBinary: false }, patch: '', status: 'no-longer-changed' };
           }
-          throw new DiffRequestError('git-error', result.stderr || 'Unable to diff untracked file');
+          throw new DiffRequestError('git-error', untrackedResult.stderr || 'Unable to diff untracked file');
         }
       }
     }
@@ -238,6 +248,24 @@ export class GitDiffManager {
   private validateDiffPath(path: string): void {
     if (!path || isAbsolute(path) || path.split(/[\\/]/).includes('..')) {
       throw new DiffRequestError('invalid-path', 'Diff path must be repository-relative');
+    }
+  }
+
+  private async executePatch(
+    runner: CommandRunner,
+    args: readonly string[],
+    worktreePath: string,
+    options: ExecFileAsyncOptions,
+  ): Promise<ExecFileResult> {
+    try {
+      return await runner.execFile('git', args, worktreePath, options);
+    } catch (cause: unknown) {
+      // SAFETY: CommandExecutor preserves Node's string overflow code on execFile errors.
+      const error = cause as { code?: string };
+      if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+        throw new DiffRequestError('diff-too-large', 'File diff exceeds the configured size limit');
+      }
+      throw cause;
     }
   }
 

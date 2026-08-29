@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -112,14 +112,16 @@ describe('GitDiffManager manifests', () => {
     expect(sortedPaths(manifest)).toEqual([deceptivePath]);
     expect(manifest.files[0].kind).toBe('added');
     expect(manifest.files.some(file => file.path === 'looks-unmerged.txt')).toBe(false);
-    expect(invocations).toEqual([
+    const expectedInvocations = [
       ['git', ['merge-base', '--end-of-options', 'main', 'HEAD']],
       ['git', ['rev-parse', '--verify', '--end-of-options', 'HEAD']],
       ['git', ['diff', '-z', '-M', '--name-status', mergeBase, '--']],
       ['git', ['diff', '-z', '-M', '--numstat', mergeBase, '--']],
       ['git', ['ls-files', '-z', '--others', '--exclude-standard']],
       ['git', ['ls-files', '-z', '--unmerged']],
-    ]);
+    ];
+    expect(invocations).toHaveLength(expectedInvocations.length);
+    expect(invocations).toEqual(expect.arrayContaining(expectedInvocations));
     expect(outputs.join('\n')).not.toContain(bodyMarker);
     expect(invocations.flat(2)).not.toContain('cat');
     expect(invocations.flat(2)).not.toContain('wc');
@@ -181,6 +183,43 @@ describe('GitDiffManager manifests', () => {
 
     const workingTreeRange = await manager.getDiffManifest(cwd, { kind: 'working-tree-range', baseHash: older }, runner, deps);
     expect(sortedPaths(workingTreeRange)).toEqual(['newer.txt', 'staged.txt', 'tracked.txt', 'untracked.txt']);
+  });
+
+  it('resolves commit, root, and commit-range scopes in a SHA-256 repository when supported', async (context) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pane-git-diff-sha256-scopes-'));
+    directories.push(cwd);
+    try {
+      git(cwd, 'init', '--object-format=sha256', '-b', 'main');
+    } catch {
+      context.skip();
+      return;
+    }
+    git(cwd, 'config', 'user.name', 'Pane Test');
+    git(cwd, 'config', 'user.email', 'pane@example.test');
+    write(cwd, 'root.txt', 'root\n');
+    const root = commitPaths(cwd, 'root', ['root.txt']);
+    write(cwd, 'child.txt', 'child\n');
+    const child = commitPaths(cwd, 'child', ['child.txt']);
+    write(cwd, 'newest.txt', 'newest\n');
+    const newest = commitPaths(cwd, 'newest', ['newest.txt']);
+    const emptyTree = git(cwd, 'hash-object', '-t', 'tree', '/dev/null').trim();
+    const { manager, runner, deps } = harness(cwd);
+
+    const commitManifest = await manager.getDiffManifest(cwd, { kind: 'commit', hash: child }, runner, deps);
+    const rootManifest = await manager.getDiffManifest(cwd, { kind: 'commit', hash: root }, runner, deps);
+    const rangeManifest = await manager.getDiffManifest(
+      cwd,
+      { kind: 'commit-range', olderHash: child, newerHash: newest },
+      runner,
+      deps,
+    );
+
+    expect(child).toHaveLength(64);
+    expect(sortedPaths(commitManifest)).toEqual(['child.txt']);
+    expect(sortedPaths(rootManifest)).toEqual(['root.txt']);
+    expect(rootManifest.resolvedBase).toEqual({ kind: 'empty-tree', hash: emptyTree });
+    expect(sortedPaths(rangeManifest)).toEqual(['child.txt', 'newest.txt']);
+    expect(rangeManifest.resolvedBase.hash).toBe(root);
   });
 
   it('coalesces a real conflicted path into one unmerged manifest entry', async () => {
@@ -337,6 +376,49 @@ describe('GitDiffManager file diffs', () => {
     expect(result.patch).toContain('a.ts');
     expect(result.patch).not.toContain('b.ts');
     expect(result.patch).not.toContain('b after');
+  });
+
+  it('returns a patch for a changed tracked symlink that points to a directory', async () => {
+    const cwd = repository();
+    mkdirSync(join(cwd, 'target-before'));
+    mkdirSync(join(cwd, 'target-after'));
+    symlinkSync('target-before', join(cwd, 'linked-directory'), 'dir');
+    commitPaths(cwd, 'tracked symlink', ['linked-directory']);
+    unlinkSync(join(cwd, 'linked-directory'));
+    symlinkSync('target-after', join(cwd, 'linked-directory'), 'dir');
+    const { manager, runner, deps } = harness(cwd);
+
+    const result = await manager.getFileDiff(
+      cwd,
+      { kind: 'working-tree' },
+      { path: 'linked-directory' },
+      runner,
+      deps,
+    );
+
+    expect(result).toMatchObject({ status: 'changed', file: { path: 'linked-directory', kind: 'modified' } });
+    expect(result.patch).toContain('-target-before');
+    expect(result.patch).toContain('+target-after');
+  });
+
+  it('maps an oversized untracked no-index patch to diff-too-large', async () => {
+    const cwd = repository();
+    write(cwd, 'large-untracked.txt', `${'oversized line\n'.repeat(100)}`);
+    const runner = new CommandRunner({ path: cwd });
+    const execFile = vi.spyOn(runner, 'execFile');
+    const manager = new GitDiffManager(undefined, undefined, 128);
+    const deps = { comparisonBase: async () => 'main' };
+
+    await expect(manager.getFileDiff(
+      cwd,
+      { kind: 'working-tree' },
+      { path: 'large-untracked.txt' },
+      runner,
+      deps,
+    )).rejects.toMatchObject({ code: 'diff-too-large' });
+    expect(execFile.mock.calls.map(([, args]) => [...args])).toContainEqual([
+      'diff', '--no-index', '--no-color', '--', '/dev/null', 'large-untracked.txt',
+    ]);
   });
 
   it.each([

@@ -19,7 +19,7 @@ export const fileDiffRequestSchema = boundary.object({
 });
 
 export function isHexHash(value: string): boolean {
-  return /^[0-9a-f]{4,40}$/i.test(value);
+  return /^[0-9a-f]{4,64}$/i.test(value);
 }
 
 function validateScopeHashes(scope: DiffScope): void {

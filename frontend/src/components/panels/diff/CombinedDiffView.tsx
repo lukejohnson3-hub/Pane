@@ -8,9 +8,8 @@ import { CommitDialog } from '../../CommitDialog';
 import { editorPanelState, openFileInEditor } from '../../../services/openFileInEditor';
 import { usePanelStore } from '../../../stores/panelStore';
 import { ChangesTree } from './ChangesTree';
-import { defaultExpanded, reconcileExpanded } from './changesTreeModel';
+import { buildChangesTree, compactChains, defaultExpanded, reconcileExpanded } from './changesTreeModel';
 import { editorDiffRefForFile, isMutableScope, scopeKey, scopeLabel } from './diffScope';
-import { buildChangesTree, compactChains } from './changesTreeModel';
 import { clearPendingViewCommit, takePendingViewCommit } from './pendingViewCommit';
 
 const HISTORY_LIMIT = 50;
