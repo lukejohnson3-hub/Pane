@@ -1,3 +1,5 @@
+import type { DiffScope } from './gitDiff';
+
 /**
  * Panel and session types for Pane.
  * Note: "Sessions" are called "Panes" in the UI. Internally they remain
@@ -143,9 +145,11 @@ export interface ExplorerPanelState {
  * modes: a commit hash (`'index'` = uncommitted) or an execution range
  * (`[0]` = uncommitted, `[a, b]` = one commit, omitted = every commit).
  */
-export type EditorDiffRef =
+export type LegacyEditorDiffRef =
   | { kind: 'commit'; hash: string }
   | { kind: 'range'; executionIds?: number[] };
+
+export type EditorDiffRef = { kind: 'scope'; scope: DiffScope; previousPath?: string };
 
 export interface EditorPanelState {
   filePath: string;

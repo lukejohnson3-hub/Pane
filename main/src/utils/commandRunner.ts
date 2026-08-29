@@ -1,4 +1,5 @@
 import { commandExecutor } from './commandExecutor';
+import type { ExecFileAsyncOptions, ExecFileResult } from './commandExecutor';
 import { getWSLContextFromProject, type WSLContext } from './wslUtils';
 
 export class CommandRunner {
@@ -24,6 +25,14 @@ export class CommandRunner {
     return commandExecutor.execAsync(command, {
       cwd,
       ...options,
+      env: options?.env ? { ...process.env, ...options.env } : undefined,
+    }, this.wslContext);
+  }
+
+  async execFile(file: string, args: readonly string[], cwd: string, options?: ExecFileAsyncOptions): Promise<ExecFileResult> {
+    return commandExecutor.execFileAsync(file, args, {
+      ...options,
+      cwd,
       env: options?.env ? { ...process.env, ...options.env } : undefined,
     }, this.wslContext);
   }

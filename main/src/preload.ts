@@ -22,6 +22,7 @@ import type {
   RemotePaneConnectionProfile,
 } from '../../shared/types/remoteDaemon';
 import type { ToolPanel } from '../../shared/types/panels';
+import type { DiffScope, FileDiffRequest } from '../../shared/types/gitDiff';
 import type { PanelAgentStatusEvent } from '../../shared/types/agentStatus';
 import type { AgentUsageSnapshot } from '../../shared/types/agentUsage';
 import type { CloudVmState } from '../../shared/types/cloud';
@@ -526,8 +527,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getExecutionDiff: (sessionId: string, executionId: string): Promise<IPCResponse> => invokeIpc('sessions:get-execution-diff', sessionId, executionId),
     gitCommit: (sessionId: string, message: string): Promise<IPCResponse> => invokeIpc('sessions:git-commit', sessionId, message),
     gitDiff: (sessionId: string): Promise<IPCResponse> => invokeIpc('sessions:git-diff', sessionId),
-    getCombinedDiff: (sessionId: string, executionIds?: number[]): Promise<IPCResponse> => invokeIpc('sessions:get-combined-diff', sessionId, executionIds),
-    getCommitDiffByHash: (sessionId: string, commitHash: string): Promise<IPCResponse> => invokeIpc('sessions:get-commit-diff-by-hash', sessionId, commitHash),
+    getDiffManifest: (sessionId: string, scope: DiffScope): Promise<IPCResponse> => invokeIpc('sessions:get-diff-manifest', sessionId, scope),
+    getFileDiff: (sessionId: string, scope: DiffScope, request: FileDiffRequest): Promise<IPCResponse> => invokeIpc('sessions:get-file-diff', sessionId, scope, request),
 
     // Main repo session
     getOrCreateMainRepoSession: (projectId: number): Promise<IPCResponse> => invokeIpc('sessions:get-or-create-main-repo', projectId),

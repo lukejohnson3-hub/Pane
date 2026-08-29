@@ -1,7 +1,7 @@
 import { execSync as nodeExecSync, execFileSync as nodeExecFileSync, ExecSyncOptions, ExecSyncOptionsWithStringEncoding, ExecSyncOptionsWithBufferEncoding, exec, execFile, ExecOptions, ExecFileOptions } from 'child_process';
 import { promisify } from 'util';
 import { getShellPath } from './shellPath';
-import { WSLContext, getWSLExecArgs } from './wslUtils';
+import { WSLContext, escapeForBash, getWSLExecArgs } from './wslUtils';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 
 const nodeExecAsync = promisify(exec);
@@ -43,6 +43,23 @@ interface ExtendedExecSyncOptions extends ExecSyncOptions {
 interface ExtendedExecAsyncOptions extends ExecOptions {
   timeout?: number;
   silent?: boolean;
+}
+
+export interface ExecFileAsyncOptions extends ExecFileOptions {
+  okExitCodes?: number[];
+  silent?: boolean;
+}
+
+export interface ExecFileResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+interface ExecFileFailure extends Error {
+  code?: number | string;
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
 }
 
 class CommandExecutor {
@@ -223,6 +240,55 @@ class CommandExecutor {
         console.error(`[CommandExecutor] Async Failed: ${command}`);
         console.error(`[CommandExecutor] Async Error: ${error instanceof Error ? error.message : String(error)}`);
       }
+      throw error;
+    }
+  }
+
+  async execFileAsync(
+    file: string,
+    args: readonly string[],
+    options?: ExecFileAsyncOptions,
+    wslContext?: WSLContext | null,
+  ): Promise<ExecFileResult> {
+    const cwd = options?.cwd || process.cwd();
+    const shellPath = getShellPath();
+    const silentMode = options?.silent === true;
+    const { okExitCodes = [], silent: _silent, ...cleanOptions } = options || {};
+    void _silent;
+    let executable = file;
+    let executableArgs = [...args];
+    let executionOptions: ExecFileOptions = {
+      ...cleanOptions,
+      cwd,
+      timeout: cleanOptions.timeout || 60_000,
+      maxBuffer: cleanOptions.maxBuffer || 10 * 1024 * 1024,
+      env: { ...process.env, ...cleanOptions.env, PATH: shellPath },
+    };
+
+    if (wslContext) {
+      const wslCwd = decodeStringCwd(cwd);
+      const extraEnv = getExtraEnvVars(cleanOptions.env);
+      const command = [file, ...args].map(escapeForBash).join(' ');
+      const wrapped = getWSLExecArgs(command, wslContext.distribution, wslCwd, extraEnv);
+      executable = wrapped.file;
+      executableArgs = wrapped.args;
+      executionOptions = { ...executionOptions, cwd: undefined };
+    }
+
+    if (!silentMode) console.log(`[CommandExecutor] Executing file: ${executable} ${executableArgs.join(' ')} in ${cwd}`);
+    try {
+      const result = await nodeExecFileAsync(executable, executableArgs, executionOptions);
+      return { stdout: String(result.stdout), stderr: String(result.stderr), exitCode: 0 };
+    } catch (cause: unknown) {
+      // SAFETY: Node's execFile rejection contract supplies Error plus code/stdout/stderr.
+      const error = cause as ExecFileFailure;
+      if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw error;
+      let numericCode: number | null = null;
+      try { numericCode = decodeBoundary(error.code, boundary.number); } catch { numericCode = null; }
+      if (numericCode !== null && okExitCodes.includes(numericCode)) {
+        return { stdout: String(error.stdout ?? ''), stderr: String(error.stderr ?? ''), exitCode: numericCode };
+      }
+      if (!silentMode) console.error(`[CommandExecutor] File execution failed: ${error.message}`);
       throw error;
     }
   }
