@@ -18,6 +18,7 @@ const DEFAULT_SIDEBAR_WIDTH = 300;
 const MIN_SIDEBAR_WIDTH = 150;
 const MAX_SIDEBAR_WIDTH = 600;
 const SESSION_SCOPE: DiffScope = { kind: 'session' };
+const NO_EXPANSION: ReadonlySet<string> = new Set();
 
 export interface CombinedDiffViewHandle { refresh: () => void }
 
@@ -60,7 +61,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   const executionRequestId = useRef(0);
 
   const key = `${sessionId}:${scopeKey(scope)}`;
-  const expanded = expandedByScope[key] ?? new Set<string>();
+  const expanded = useMemo(() => expandedByScope[key] ?? NO_EXPANSION, [expandedByScope, key]);
   const visible = display?.key === key ? display : null;
   const visibleManifest = visible?.manifest ?? null;
   const loading = loadingKey === key || (visible === null && error === null);
