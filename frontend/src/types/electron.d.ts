@@ -33,6 +33,7 @@ import type {
 } from '../../../shared/types/panels';
 import type { JsonValue } from '../../../shared/validation/boundaryDecoder';
 import type { PanelAgentStatusEvent } from '../../../shared/types/agentStatus';
+import type { DiffManifest, DiffScope, FileDiffRequest, FileDiffResult } from '../../../shared/types/gitDiff';
 import type { AgentUsageSnapshot } from '../../../shared/types/agentUsage';
 import type { PaneChatAgent, PaneChatState } from '../../../shared/types/paneChat';
 import type { UsageIndexStatus, UsageReport, UsageReportRequest } from '../../../shared/types/usage';
@@ -70,6 +71,7 @@ interface IPCResponse<T = any> {
   error?: string;
   details?: string;
   command?: string;
+  code?: string;
 }
 
 interface ElectronAPI {
@@ -176,8 +178,8 @@ interface ElectronAPI {
     getExecutionDiff: (sessionId: string, executionId: string) => Promise<IPCResponse>;
     gitCommit: (sessionId: string, message: string) => Promise<IPCResponse>;
     gitDiff: (sessionId: string) => Promise<IPCResponse>;
-    getCombinedDiff: (sessionId: string, executionIds?: number[]) => Promise<IPCResponse>;
-    getCommitDiffByHash: (sessionId: string, commitHash: string) => Promise<IPCResponse>;
+    getDiffManifest: (sessionId: string, scope: DiffScope) => Promise<IPCResponse<DiffManifest>>;
+    getFileDiff: (sessionId: string, scope: DiffScope, request: FileDiffRequest) => Promise<IPCResponse<FileDiffResult>>;
 
     // Script operations
     hasRunScript: (sessionId: string) => Promise<IPCResponse>;
