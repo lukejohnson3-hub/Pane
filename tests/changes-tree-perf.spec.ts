@@ -13,7 +13,7 @@ test('5,000-file tree mounts only the viewport and reports paint timing', async 
     new PerformanceObserver(list => { for (const entry of list.getEntries()) tasks.push({ startTime: entry.startTime, duration: entry.duration }); }).observe({ type: 'longtask', buffered: true });
     Object.assign(window, { __paneDiffLongTasks: tasks });
   });
-  await installElectronApiMock(page, { initialProjects: [project], initialSessions: [session], initialPanels: panels, initialExecutions: [], diffManifests: { session: manifest }, initialUiState: { expandedProjects: [project.id] }, activeProjectId: project.id });
+  await installElectronApiMock(page, { initialProjects: [project], initialSessions: [session], initialPanels: panels, initialExecutions: [], diffManifests: { session: manifest }, initialUiState: { expandedProjects: [project.id] }, activeProjectId: project.id, testPerf: true });
   await page.goto('/');
   await page.getByRole('button', { name: session.name, exact: true }).click();
   await page.getByRole('tab', { name: 'Changes', exact: true }).click();
@@ -22,6 +22,20 @@ test('5,000-file tree mounts only the viewport and reports paint timing', async 
   await page.waitForFunction(() => performance.getEntriesByName('pane-diff-tree-painted').length > 0);
   const mountedRows = await tree.getByRole('treeitem').count();
   expect(mountedRows).toBeLessThanOrEqual(40);
+  expect(await page.evaluate(() => {
+    // SAFETY: installElectronApiMock defines this controller before application code runs.
+    const mockWindow = window as typeof window & { __paneTestElectronMock: { getFileDiffCalls: () => unknown[] } };
+    return mockWindow.__paneTestElectronMock.getFileDiffCalls().length;
+  })).toBe(0);
+
+  const firstFolder = page.getByRole('treeitem', { name: 'dir-000', exact: true });
+  await firstFolder.click();
+  await expect(firstFolder).toHaveAttribute('aria-expanded', 'false');
+  expect(await tree.getByRole('treeitem').count()).toBeLessThanOrEqual(40);
+  await firstFolder.click();
+  await expect(firstFolder).toHaveAttribute('aria-expanded', 'true');
+  expect(await tree.getByRole('treeitem').count()).toBeLessThanOrEqual(40);
+
   await tree.evaluate(element => { element.scrollTop = element.scrollHeight; element.dispatchEvent(new Event('scroll')); });
   await page.waitForTimeout(50);
   const maxMountedRows = Math.max(mountedRows, await tree.getByRole('treeitem').count());

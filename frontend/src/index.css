@@ -1045,7 +1045,7 @@ body.understory {
 }
 
 @container (max-width: 600px) {
-.pane-review-split {
+  .pane-review-split {
     flex-direction: column;
   }
   .pane-review-list {

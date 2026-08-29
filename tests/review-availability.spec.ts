@@ -283,7 +283,10 @@ test('Review stays local until a newly discovered pull request is explicitly ope
   await expect(diffSummary.getByText('-3', { exact: true })).toBeVisible();
 
   // Files in Changes open as center diff tabs (preview on single-click), not inline.
-  const reviewFile = page.getByRole('treeitem', { name: 'Open diff for src/review.ts', exact: true });
+  const reviewFile = page.getByRole('treeitem', {
+    name: 'Open diff for src/review.ts, Modified, +8 −3',
+    exact: true,
+  });
   await reviewFile.click();
   const diffTab = page.getByRole('tab', { name: 'review.ts (All changes)', exact: true });
   await expect(diffTab).toHaveAttribute('aria-selected', 'true');

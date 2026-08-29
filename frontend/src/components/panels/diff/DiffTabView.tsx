@@ -16,14 +16,26 @@ const REFRESH_EVENTS = new Set(['git:operation_completed', 'diff:refreshed', 'te
 const resultCache = new Map<string, FileDiffResult>();
 const MAX_CACHE_ENTRIES = 50;
 
+interface FileDiffLoadState {
+  key: string;
+  result: FileDiffResult | null;
+  loading: boolean;
+  error: string | null;
+}
+
 const readViewType = (): DiffModeEnum => localStorage.getItem('diffViewType') === 'split' ? DiffModeEnum.Split : DiffModeEnum.Unified;
 
 export function DiffTabView({ sessionId, filePath, diffRef }: DiffTabViewProps) {
   const { theme } = useTheme();
   const normalized = useMemo(() => normalizeEditorDiffRef(diffRef), [diffRef]);
-  const [result, setResult] = useState<FileDiffResult | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const requestKey = normalized
+    ? `${sessionId}:${scopeKey(normalized.scope)}:${filePath}:${normalized.previousPath ?? ''}`
+    : `${sessionId}:legacy:${filePath}`;
+  const [loadState, setLoadState] = useState<FileDiffLoadState>({ key: '', result: null, loading: true, error: null });
+  const ownedState = loadState.key === requestKey
+    ? loadState
+    : { key: requestKey, result: null, loading: true, error: null };
+  const { result, loading, error } = ownedState;
   const [highlighter, setHighlighter] = useState<DiffHighlighter | null>(null);
   const [viewType, setViewType] = useState<DiffModeEnum>(readViewType);
   const [reloadTick, setReloadTick] = useState(0);
@@ -34,28 +46,39 @@ export function DiffTabView({ sessionId, filePath, diffRef }: DiffTabViewProps) 
   useEffect(() => {
     const owned = ++requestId.current;
     if (!normalized) {
-      setLoading(false);
-      setResult(null);
-      setError('This diff tab was saved by an earlier Pane version — reopen it from Changes.');
+      setLoadState({
+        key: requestKey,
+        result: null,
+        loading: false,
+        error: 'This diff tab was saved by an earlier Pane version — reopen it from Changes.',
+      });
       return;
     }
-    const cacheKey = `${sessionId}:${scopeKey(normalized.scope)}:${filePath}`;
-    const cached = resultCache.get(cacheKey);
+    const cached = resultCache.get(requestKey);
     if (cached && !isMutableScope(normalized.scope)) {
-      setResult(cached); setLoading(false); setError(null); return;
+      setLoadState({ key: requestKey, result: cached, loading: false, error: null });
+      return;
     }
-    setLoading(true); setError(null);
+    setLoadState({ key: requestKey, result: null, loading: true, error: null });
     void API.sessions.getFileDiff(sessionId, normalized.scope, { path: filePath, previousPath: normalized.previousPath }).then(response => {
       if (owned !== requestId.current) return;
       if (!response.success || !response.data) throw new Error(`${response.code ? `${response.code}: ` : ''}${response.error || 'Failed to load diff'}`);
-      setResult(response.data);
+      setLoadState({ key: requestKey, result: response.data, loading: false, error: null });
       if (!isMutableScope(normalized.scope)) {
-        resultCache.set(cacheKey, response.data);
+        resultCache.set(requestKey, response.data);
         while (resultCache.size > MAX_CACHE_ENTRIES) resultCache.delete(resultCache.keys().next().value!);
       }
-    }).catch(cause => { if (owned === requestId.current) setError(cause instanceof Error ? cause.message : 'Failed to load diff'); })
-      .finally(() => { if (owned === requestId.current) setLoading(false); });
-  }, [diffRef, filePath, normalized, reloadTick, sessionId]);
+    }).catch(cause => {
+      if (owned === requestId.current) {
+        setLoadState({
+          key: requestKey,
+          result: null,
+          loading: false,
+          error: cause instanceof Error ? cause.message : 'Failed to load diff',
+        });
+      }
+    });
+  }, [filePath, normalized, reloadTick, requestKey, sessionId]);
 
   useEffect(() => {
     if (!normalized || !isMutableScope(normalized.scope)) return;
@@ -79,7 +102,7 @@ export function DiffTabView({ sessionId, filePath, diffRef }: DiffTabViewProps) 
       hunks: [result.patch],
     };
   }, [result]);
-  const canOpenFile = result?.file.kind !== 'deleted';
+  const canOpenFile = result !== null && result.file.kind !== 'deleted';
 
   return (
     <div className="flex h-full w-full min-w-0 flex-col overflow-hidden">

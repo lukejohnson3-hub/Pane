@@ -1,4 +1,4 @@
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { RefreshCw } from 'lucide-react';
 import type { ChangedFileSummary, DiffManifest, DiffScope } from '../../../../../shared/types/gitDiff';
 import type { CombinedDiffViewProps, ExecutionDiff } from '../../../types/diff';
@@ -14,6 +14,10 @@ import { buildChangesTree, compactChains } from './changesTreeModel';
 import { clearPendingViewCommit, takePendingViewCommit } from './pendingViewCommit';
 
 const HISTORY_LIMIT = 50;
+const SIDEBAR_STORAGE_KEY = 'diff-panel-sidebar-width';
+const DEFAULT_SIDEBAR_WIDTH = 300;
+const MIN_SIDEBAR_WIDTH = 150;
+const MAX_SIDEBAR_WIDTH = 600;
 
 export interface CombinedDiffViewHandle { refresh: () => void }
 
@@ -26,13 +30,24 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   const [executions, setExecutions] = useState<ExecutionDiff[]>([]);
   const [scope, setScope] = useState<DiffScope>({ kind: 'session' });
   const [manifest, setManifest] = useState<DiffManifest | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loadingKey, setLoadingKey] = useState<string | null>(null);
   const [executionsLoading, setExecutionsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [showCommitDialog, setShowCommitDialog] = useState(false);
+  const [mainBranch, setMainBranch] = useState('main');
+  const [historySource, setHistorySource] = useState<'remote' | 'local' | 'branch'>(isMainRepo ? 'remote' : 'branch');
   const [expandedByScope, setExpandedByScope] = useState<Record<string, Set<string>>>({});
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const stored = localStorage.getItem(SIDEBAR_STORAGE_KEY);
+    const width = stored ? Number.parseInt(stored, 10) : Number.NaN;
+    return Number.isNaN(width) || width < MIN_SIDEBAR_WIDTH || width > MAX_SIDEBAR_WIDTH
+      ? DEFAULT_SIDEBAR_WIDTH
+      : width;
+  });
+  const [isResizing, setIsResizing] = useState(false);
   const manifestCache = useRef(new Map<string, DiffManifest>());
+  const manifestTreeCache = useRef(new Map<string, ReturnType<typeof compactChains>>());
   const requestId = useRef(0);
   const executionRequestId = useRef(0);
   const displayedKey = useRef<string | null>(null);
@@ -40,6 +55,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   const key = `${sessionId}:${scopeKey(scope)}`;
   const expanded = expandedByScope[key] ?? new Set<string>();
   const visibleManifest = displayedKey.current === key ? manifest : null;
+  const loading = loadingKey === key || (visibleManifest === null && error === null);
 
   const activeDiffPath = usePanelStore((state) => {
     const activeId = state.activePanels[sessionId];
@@ -49,12 +65,10 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   });
 
   const refresh = useCallback(() => {
-    for (const cacheKey of manifestCache.current.keys()) {
-      if (cacheKey.startsWith(`${sessionId}:`)) manifestCache.current.delete(cacheKey);
-    }
+    if (isMutableScope(scope)) manifestCache.current.delete(key);
     requestId.current += 1;
     setRefreshNonce(value => value + 1);
-  }, [sessionId]);
+  }, [key, scope]);
 
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
@@ -64,10 +78,53 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     setExecutions([]);
     setExpandedByScope({});
     manifestCache.current.clear();
+    manifestTreeCache.current.clear();
     requestId.current += 1;
     executionRequestId.current += 1;
     displayedKey.current = null;
-  }, [sessionId]);
+    setLoadingKey(null);
+    setMainBranch('main');
+    setHistorySource(isMainRepo ? 'remote' : 'branch');
+  }, [isMainRepo, sessionId]);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarWidth.toString());
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    if (!isResizing) return;
+    const handleMouseMove = (event: MouseEvent) => {
+      const container = document.querySelector('.combined-diff-view');
+      if (!container) return;
+      const width = event.clientX - container.getBoundingClientRect().left;
+      setSidebarWidth(Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, width)));
+    };
+    const handleMouseUp = () => setIsResizing(false);
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isResizing]);
+
+  const handleResizeStart = useCallback((event: ReactMouseEvent) => {
+    event.preventDefault();
+    setIsResizing(true);
+  }, []);
+
+  useEffect(() => {
+    void API.sessions.getGitCommands(sessionId).then(response => {
+      if (!response.success || !response.data) return;
+      const branch = response.data.originBranch || response.data.comparisonBaseBranch || 'main';
+      setMainBranch(branch);
+      if (isMainRepo) setHistorySource(response.data.originBranch ? 'remote' : 'local');
+    }).catch(cause => console.error('Failed to load git commands:', cause));
+  }, [isMainRepo, sessionId]);
 
   useEffect(() => {
     if (!isVisible) return;
@@ -76,7 +133,11 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     void API.sessions.getExecutions(sessionId).then(response => {
       if (owned !== executionRequestId.current) return;
       if (!response.success) throw new Error(response.error || 'Failed to load commits');
-      setExecutions(response.data ?? []);
+      const data: ExecutionDiff[] = response.data ?? [];
+      setExecutions(data);
+      const metadata = data.find(execution => execution.comparison_branch || execution.history_source) ?? data[0];
+      if (metadata?.comparison_branch) setMainBranch(metadata.comparison_branch);
+      if (metadata?.history_source) setHistorySource(metadata.history_source);
     }).catch(cause => {
       if (owned === executionRequestId.current) setError(cause instanceof Error ? cause.message : 'Failed to load commits');
     }).finally(() => {
@@ -102,14 +163,15 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     if (!isVisible) return;
     const owned = ++requestId.current;
     const cached = manifestCache.current.get(key);
-    if (cached && (!isMutableScope(scope) || refreshNonce === 0)) {
+    if (cached) {
       setManifest(cached);
       displayedKey.current = key;
+      setLoadingKey(null);
       setError(null);
       return;
     }
     if (displayedKey.current !== key) setManifest(null);
-    setLoading(true);
+    setLoadingKey(key);
     setError(null);
     void API.sessions.getDiffManifest(sessionId, scope).then(response => {
       if (owned !== requestId.current) return;
@@ -119,14 +181,16 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
       setManifest(data);
       displayedKey.current = key;
       const tree = compactChains(buildChangesTree(data.files));
+      const previousTree = manifestTreeCache.current.get(key);
+      manifestTreeCache.current.set(key, tree);
       setExpandedByScope(previous => ({
         ...previous,
-        [key]: previous[key] ? reconcileExpanded(previous[key], tree) : defaultExpanded(tree),
+        [key]: previous[key] ? reconcileExpanded(previous[key], tree, previousTree) : defaultExpanded(tree),
       }));
     }).catch(cause => {
       if (owned === requestId.current) setError(cause instanceof Error ? cause.message : 'Failed to load changes');
     }).finally(() => {
-      if (owned === requestId.current) setLoading(false);
+      if (owned === requestId.current) setLoadingKey(null);
     });
   }, [isVisible, key, refreshNonce, scope, sessionId]);
 
@@ -134,7 +198,12 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
     if (scope.kind === 'session') return { kind: 'all' };
     if (scope.kind === 'working-tree') return { kind: 'ids', ids: [0] };
     const byHash = new Map(executions.map(execution => [execution.after_commit_hash, execution.id]));
-    if (scope.kind === 'commit') return { kind: 'ids', ids: [byHash.get(scope.hash) ?? -1].filter(id => id >= 0) };
+    if (scope.kind === 'commit') {
+      const match = executions.find(execution =>
+        execution.after_commit_hash === scope.hash || execution.after_commit_hash?.startsWith(scope.hash) === true,
+      );
+      return { kind: 'ids', ids: match ? [match.id] : [] };
+    }
     if (scope.kind === 'commit-range') return { kind: 'ids', ids: [byHash.get(scope.olderHash), byHash.get(scope.newerHash)].filter((id): id is number => id !== undefined) };
     return { kind: 'ids', ids: [0, byHash.get(scope.baseHash)].filter((id): id is number => id !== undefined) };
   }, [executions, scope]);
@@ -189,27 +258,43 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   }, [refresh, sessionId]);
 
   const label = scopeLabel(scope, { ref: visibleManifest?.resolvedBase.ref });
+  const historyLabel = isMainRepo ? (historySource === 'local' ? 'Local commits' : mainBranch) : null;
+  const headerLabel = historyLabel ? `${historyLabel} · ${label}` : label;
   const busy = loading || executionsLoading || isGitOperationRunning;
   const historyLimitReached = executions.some(execution => execution.history_limit_reached);
+  const emptyMessage = isMainRepo && executions.length === 0
+    ? historySource === 'remote'
+      ? `No commits ahead of ${mainBranch}`
+      : 'Origin remote not found; showing recent local commits'
+    : 'No changes to review';
 
   return (
     <div className="combined-diff-view flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border-primary bg-surface-secondary px-3 py-1.5">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-xs font-medium text-text-secondary">{label}</span>
+          <span className="truncate text-xs font-medium text-text-secondary">{headerLabel}</span>
           {visibleManifest && <div className="flex flex-shrink-0 items-center gap-2 text-xs"><span className="font-semibold text-status-success">+{visibleManifest.stats.additions}</span><span className="font-semibold text-status-error">-{visibleManifest.stats.deletions}</span><span className="text-text-muted">{visibleManifest.stats.filesChanged}f</span></div>}
         </div>
         <button type="button" onClick={refresh} disabled={busy} className="rounded p-1 hover:bg-surface-hover" title="Refresh"><RefreshCw className={`h-3.5 w-3.5 text-text-tertiary ${busy ? 'animate-spin' : ''}`} /></button>
       </div>
       <div className="pane-review-split flex min-h-0 flex-1">
-        <div className="pane-review-list flex w-[300px] flex-shrink-0 flex-col overflow-hidden border-r border-border-primary bg-surface-secondary">
+        <div className="pane-review-list flex flex-shrink-0 flex-col overflow-hidden border-r border-border-primary bg-surface-secondary" style={{ width: sidebarWidth }}>
           <ExecutionList sessionId={sessionId} executions={executions} selection={selection} onSelectAll={() => setScope({ kind: 'session' })} onSelectionChange={selectIds} onCommit={() => setShowCommitDialog(true)} onRevert={handleRevert} onRestore={handleRestore} historyLimitReached={historyLimitReached} historyLimit={HISTORY_LIMIT} />
         </div>
+        <div className="pane-review-handle w-1 flex-shrink-0 cursor-col-resize bg-transparent" onMouseDown={handleResizeStart} title="Drag to resize sidebar" />
         <div className="diff-panel flex min-w-0 flex-1 flex-col overflow-hidden bg-bg-primary">
-          {loading && !visibleManifest ? <div className="animate-pulse p-4 text-sm text-text-secondary">Loading {label}…</div>
+          {isGitOperationRunning ? (
+            <div className="flex h-full flex-col items-center justify-center p-8">
+              <RefreshCw className="mb-4 h-12 w-12 animate-spin text-interactive" />
+              <div className="text-center text-text-secondary">
+                <p className="font-medium">Git operation in progress</p>
+                <p className="mt-1 text-sm text-text-tertiary">Please wait while the operation completes...</p>
+              </div>
+            </div>
+          ) : loading && !visibleManifest ? <div className="animate-pulse p-4 text-sm text-text-secondary">Loading {label}…</div>
             : error ? <div role="alert" className="m-4 rounded border border-status-error/30 bg-status-error/10 p-4 text-sm text-status-error">{error}</div>
               : visibleManifest && visibleManifest.files.length > 0 ? <ChangesTree sessionId={sessionId} manifest={visibleManifest} scopeKey={scopeKey(scope)} activePath={activeDiffPath} expanded={expanded} onExpandedChange={next => setExpandedByScope(previous => ({ ...previous, [key]: next }))} onFileOpen={handleFileOpen} />
-                : <div className="flex h-full items-center justify-center text-sm text-text-secondary">No changes to review</div>}
+                : <div className="flex h-full items-center justify-center text-sm text-text-secondary"><div className="space-y-2 text-center"><p>{emptyMessage}</p>{isMainRepo && historySource === 'remote' && <p className="text-sm text-text-tertiary">Create new commits to see them here.</p>}</div></div>}
         </div>
       </div>
       <CommitDialog isOpen={showCommitDialog} onClose={() => setShowCommitDialog(false)} onCommit={handleCommit} fileCount={visibleManifest?.stats.filesChanged ?? 0} />

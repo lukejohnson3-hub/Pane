@@ -83,7 +83,7 @@ export function compactChains(tree: ChangesTreeNode): ChangesTreeNode {
     }
     return copy;
   };
-  return compact(tree);
+  return { ...tree, displaySegments: [], children: tree.children.map(compact) };
 }
 
 const folderIds = (tree: ChangesTreeNode): string[] => [tree.id, ...tree.children.flatMap(folderIds)].filter(id => id.startsWith('d:'));
@@ -92,9 +92,14 @@ export function defaultExpanded(tree: ChangesTreeNode): Set<string> {
   return new Set(folderIds(tree));
 }
 
-export function reconcileExpanded(previous: ReadonlySet<string>, tree: ChangesTreeNode): Set<string> {
+export function reconcileExpanded(
+  previous: ReadonlySet<string>,
+  tree: ChangesTreeNode,
+  previousTree?: ChangesTreeNode,
+): Set<string> {
   const current = new Set(folderIds(tree));
-  return new Set([...current].filter(id => previous.has(id)));
+  const prior = new Set(previousTree ? folderIds(previousTree) : []);
+  return new Set([...current].filter(id => previous.has(id) || !prior.has(id)));
 }
 
 export function flattenRows(tree: ChangesTreeNode, expanded: ReadonlySet<string>): TreeRow[] {

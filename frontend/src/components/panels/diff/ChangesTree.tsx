@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, FileText, Folder } from 'lucide-react';
 import type { ChangedFileSummary, DiffManifest } from '../../../../../shared/types/gitDiff';
 import { cn } from '../../../utils/cn';
@@ -11,6 +11,12 @@ const OVERSCAN = 8;
 const statusLabel = (file: ChangedFileSummary): string => {
   if (file.kind === 'renamed') return `Renamed from ${file.previousPath ?? 'unknown path'}`;
   return `${file.kind[0].toUpperCase()}${file.kind.slice(1)}`;
+};
+
+const accessibleFileLabel = (file: ChangedFileSummary): string => {
+  const additions = file.additions === null ? 'additions unavailable' : `+${file.additions}`;
+  const deletions = file.deletions === null ? 'deletions unavailable' : `−${file.deletions}`;
+  return `Open diff for ${file.path}, ${statusLabel(file)}, ${additions} ${deletions}`;
 };
 
 export const ChangesTree = memo(function ChangesTree({
@@ -39,7 +45,12 @@ export const ChangesTree = memo(function ChangesTree({
   const tree = useMemo(() => compactChains(buildChangesTree(manifest.files)), [manifest.files]);
   const rows = useMemo(() => flattenRows(tree, expanded), [tree, expanded]);
   const treeId = useMemo(() => `changes-tree-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '-')}-${scopeKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`, [scopeKey, sessionId]);
-  const registerScrollSurface = useScrollSurface<HTMLDivElement>({ id: `diff:${sessionId}`, sessionId, priority: 90, ownerElement: () => hostRef.current });
+  const ownerElement = useCallback(() => hostRef.current, []);
+  const registerScrollSurface = useScrollSurface<HTMLDivElement>({ id: `diff:${sessionId}`, sessionId, priority: 90, ownerElement });
+  const setHostElement = useCallback((element: HTMLDivElement | null) => {
+    hostRef.current = element;
+    registerScrollSurface(element);
+  }, [registerScrollSurface]);
 
   useLayoutEffect(() => {
     const host = hostRef.current;
@@ -51,6 +62,9 @@ export const ChangesTree = memo(function ChangesTree({
   }, []);
 
   useLayoutEffect(() => {
+    // SAFETY: The optional flag is installed only by the Playwright mock; absence is valid in production.
+    const perfWindow = window as typeof window & { __paneTestPerf?: boolean };
+    if (!perfWindow.__paneTestPerf) return;
     if (performance.getEntriesByName('pane-diff-manifest-received').length === 0) return;
     performance.mark('pane-diff-tree-committed');
     requestAnimationFrame(() => requestAnimationFrame(() => performance.mark('pane-diff-tree-painted')));
@@ -86,7 +100,7 @@ export const ChangesTree = memo(function ChangesTree({
 
   return (
     <div
-      ref={(element) => { hostRef.current = element; registerScrollSurface(element); }}
+      ref={setHostElement}
       role="tree"
       tabIndex={0}
       aria-label="Changed files"
@@ -122,7 +136,7 @@ export const ChangesTree = memo(function ChangesTree({
           const row = rows[index];
           const selected = row.file?.path === activePath;
           const active = index === activeIndex;
-          const label = row.kind === 'file' ? `Open diff for ${row.fullPath}` : row.label;
+          const label = row.file ? accessibleFileLabel(row.file) : row.label;
           return (
             <div
               id={`${treeId}-r${index}`}

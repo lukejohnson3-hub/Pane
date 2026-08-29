@@ -14,6 +14,7 @@ import {
   mergeSummaries,
   parseNameStatusZ,
   parseNumstatZ,
+  parseWorkingTreeFilesZ,
   resolveScope,
   type ScopeResolutionDependencies,
 } from './gitDiffScope';
@@ -90,7 +91,7 @@ export class GitDiffManager {
         return result.stdout.trim().split(/\s+/).slice(1);
       },
       mergeBase: async (ref, target) => {
-        const result = await runner.execFile('git', ['merge-base', ref, target], worktreePath, { env, silent: true, okExitCodes: [1] });
+        const result = await runner.execFile('git', ['merge-base', '--end-of-options', ref, target], worktreePath, { env, silent: true, okExitCodes: [1] });
         return result.exitCode === 0 ? result.stdout.trim() : null;
       },
     };
@@ -110,16 +111,20 @@ export class GitDiffManager {
       : [baseHash, resolved.target.hash ?? ''];
     const env = { LC_ALL: 'C' };
     const [names, stats, untracked] = await Promise.all([
-      runner.execFile('git', ['diff', '-z', '-M', '--name-status', ...range], worktreePath, { env, silent: true }),
-      runner.execFile('git', ['diff', '-z', '-M', '--numstat', ...range], worktreePath, { env, silent: true }),
+      runner.execFile('git', ['diff', '-z', '-M', '--name-status', ...range, '--'], worktreePath, { env, silent: true }),
+      runner.execFile('git', ['diff', '-z', '-M', '--numstat', ...range, '--'], worktreePath, { env, silent: true }),
       resolved.target.kind === 'working-tree'
-        ? runner.execFile('git', ['ls-files', '-z', '--others', '--exclude-standard'], worktreePath, { env, silent: true })
+        ? runner.execFile('git', ['ls-files', '-z', '--others', '--exclude-standard', '--unmerged', '--stage'], worktreePath, { env, silent: true })
         : Promise.resolve({ stdout: '', stderr: '', exitCode: 0 }),
     ]);
+    const workingTreeFiles = parseWorkingTreeFilesZ(untracked.stdout);
     const files = mergeSummaries(
-      parseNameStatusZ(names.stdout),
+      [
+        ...parseNameStatusZ(names.stdout),
+        ...workingTreeFiles.unmerged.map(path => ({ status: 'U', path })),
+      ],
       parseNumstatZ(stats.stdout),
-      untracked.stdout.split('\0').filter(Boolean),
+      workingTreeFiles.untracked,
     );
     return {
       scope,
@@ -156,8 +161,28 @@ export class GitDiffManager {
     const range = resolved.target.kind === 'working-tree'
       ? [baseHash]
       : [baseHash, resolved.target.hash ?? ''];
-    const paths = request.previousPath ? [request.path, request.previousPath] : [request.path];
     const options = { env: { LC_ALL: 'C', GIT_LITERAL_PATHSPECS: '1' }, silent: true, maxBuffer: 50 * 1024 * 1024 };
+    let validatedPreviousPath: string | undefined;
+    let validatedNamesOutput: string | undefined;
+    if (request.previousPath) {
+      const candidatePaths = [request.path, request.previousPath];
+      const candidateNames = await runner.execFile(
+        'git',
+        ['diff', '-z', '-M', '--name-status', ...range, '--', ...candidatePaths],
+        worktreePath,
+        options,
+      );
+      const isActualSource = parseNameStatusZ(candidateNames.stdout).some(record =>
+        (record.status.startsWith('R') || record.status.startsWith('C'))
+        && record.path === request.path
+        && record.previousPath === request.previousPath,
+      );
+      if (isActualSource) {
+        validatedPreviousPath = request.previousPath;
+        validatedNamesOutput = candidateNames.stdout;
+      }
+    }
+    const paths = validatedPreviousPath ? [request.path, validatedPreviousPath] : [request.path];
     let patch: string;
     try {
       patch = (await runner.execFile('git', ['diff', '-M', '--no-color', ...range, '--', ...paths], worktreePath, options)).stdout;
@@ -169,7 +194,9 @@ export class GitDiffManager {
     }
 
     const [names, stats] = await Promise.all([
-      runner.execFile('git', ['diff', '-z', '-M', '--name-status', ...range, '--', ...paths], worktreePath, options),
+      validatedNamesOutput === undefined
+        ? runner.execFile('git', ['diff', '-z', '-M', '--name-status', ...range, '--', ...paths], worktreePath, options)
+        : Promise.resolve({ stdout: validatedNamesOutput, stderr: '', exitCode: 0 }),
       runner.execFile('git', ['diff', '-z', '-M', '--numstat', ...range, '--', ...paths], worktreePath, options),
     ]);
     let files = mergeSummaries(parseNameStatusZ(names.stdout), parseNumstatZ(stats.stdout), []);
@@ -197,7 +224,7 @@ export class GitDiffManager {
 
     const file = files.find(item => item.path === request.path) ?? {
       path: request.path,
-      previousPath: request.previousPath,
+      previousPath: validatedPreviousPath,
       kind: 'modified' as const,
       additions: null,
       deletions: null,

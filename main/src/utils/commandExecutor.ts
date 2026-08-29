@@ -62,7 +62,9 @@ interface ExecFileFailure extends Error {
   stderr?: string | Buffer;
 }
 
-class CommandExecutor {
+export class CommandExecutor {
+  constructor(private readonly fileExecutor: typeof nodeExecFileAsync = nodeExecFileAsync) {}
+
   execSync(command: string, options: ExecSyncOptionsWithStringEncoding & { silent?: boolean }, wslContext?: WSLContext | null): string;
   execSync(command: string, options?: ExecSyncOptionsWithBufferEncoding & { silent?: boolean }, wslContext?: WSLContext | null): Buffer;
   execSync(command: string, options?: ExtendedExecSyncOptions, wslContext?: WSLContext | null): string | Buffer {
@@ -277,7 +279,7 @@ class CommandExecutor {
 
     if (!silentMode) console.log(`[CommandExecutor] Executing file: ${executable} ${executableArgs.join(' ')} in ${cwd}`);
     try {
-      const result = await nodeExecFileAsync(executable, executableArgs, executionOptions);
+      const result = await this.fileExecutor(executable, executableArgs, executionOptions);
       return { stdout: String(result.stdout), stderr: String(result.stderr), exitCode: 0 };
     } catch (cause: unknown) {
       // SAFETY: Node's execFile rejection contract supplies Error plus code/stdout/stderr.

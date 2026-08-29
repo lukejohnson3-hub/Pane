@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { ChangedFileSummary } from '../../../../../shared/types/gitDiff';
-import { buildChangesTree, compactChains, defaultExpanded, flattenRows, navigate, revealPath, typeAhead } from './changesTreeModel';
+import {
+  buildChangesTree,
+  compactChains,
+  defaultExpanded,
+  flattenRows,
+  navigate,
+  reconcileExpanded,
+  revealPath,
+  typeAhead,
+} from './changesTreeModel';
 
 const file = (path: string): ChangedFileSummary => ({ path, kind: 'modified', additions: 1, deletions: 1, isBinary: false });
 
@@ -22,5 +31,63 @@ describe('changes tree model', () => {
     expect(navigate(rows, 0, 'End', revealed).activeIndex).toBe(rows.length - 1);
     expect(navigate(rows, 1, 'ArrowUp', revealed).activeIndex).toBe(0);
     expect(typeAhead(rows, rows.length - 1, 'a')).toBe(0);
+  });
+
+  it('does not compact across mixed file and folder children', () => {
+    const tree = compactChains(buildChangesTree([
+      file('a/b/local.ts'),
+      file('a/b/c/deep.ts'),
+      file('a/b/d/deep.ts'),
+    ]));
+    const rows = flattenRows(tree, defaultExpanded(tree));
+
+    expect(rows.map(row => row.fullPath)).toEqual([
+      'a/b',
+      'a/b/c',
+      'a/b/c/deep.ts',
+      'a/b/d',
+      'a/b/d/deep.ts',
+      'a/b/local.ts',
+    ]);
+  });
+
+  it('keeps surviving expansion, defaults new folders open, and preserves recorded collapses', () => {
+    const previousTree = compactChains(buildChangesTree([
+      file('a/b/c/file.ts'),
+      file('collapsed/file.ts'),
+    ]));
+    const previous = defaultExpanded(previousTree);
+    previous.delete('d:collapsed');
+    const nextTree = compactChains(buildChangesTree([
+      file('a/b/c/file.ts'),
+      file('a/b/new.ts'),
+      file('collapsed/file.ts'),
+      file('new/folder/file.ts'),
+    ]));
+
+    const reconciled = reconcileExpanded(previous, nextTree, previousTree);
+
+    expect(reconciled.has('d:a/b')).toBe(true);
+    expect(reconciled.has('d:a/b/c')).toBe(true);
+    expect(reconciled.has('d:new/folder')).toBe(true);
+    expect(reconciled.has('d:collapsed')).toBe(false);
+  });
+
+  it('implements every Left and Right navigation branch', () => {
+    const tree = buildChangesTree([file('a/one.ts'), file('a/two.ts'), file('root.ts')]);
+    const expanded = defaultExpanded(tree);
+    const rows = flattenRows(tree, expanded);
+
+    const collapsed = navigate(rows, 0, 'ArrowLeft', expanded);
+    expect(collapsed.activeIndex).toBe(0);
+    expect(collapsed.expandedPatch?.has('d:a')).toBe(false);
+
+    const reexpanded = navigate(rows, 0, 'ArrowRight', collapsed.expandedPatch ?? new Set());
+    expect(reexpanded.activeIndex).toBe(0);
+    expect(reexpanded.expandedPatch?.has('d:a')).toBe(true);
+
+    expect(navigate(rows, 0, 'ArrowRight', expanded).activeIndex).toBe(1);
+    expect(navigate(rows, 1, 'ArrowLeft', expanded).activeIndex).toBe(0);
+    expect(navigate(rows, rows.length - 1, 'ArrowLeft', expanded).activeIndex).toBe(rows.length - 1);
   });
 });

@@ -67,6 +67,11 @@ export interface NumstatRecord {
   deletions: number | null;
 }
 
+export interface WorkingTreeFileRecords {
+  untracked: string[];
+  unmerged: string[];
+}
+
 const nulParts = (value: string): string[] => value.split('\0').filter((part, index, all) => part.length > 0 || index < all.length - 1);
 
 export function parseNameStatusZ(output: string): NameStatusRecord[] {
@@ -113,6 +118,17 @@ export function parseNumstatZ(output: string): NumstatRecord[] {
   return records;
 }
 
+export function parseWorkingTreeFilesZ(output: string): WorkingTreeFileRecords {
+  const untracked: string[] = [];
+  const unmerged = new Set<string>();
+  for (const record of nulParts(output)) {
+    const separator = record.indexOf('\t');
+    if (separator < 0) untracked.push(record);
+    else unmerged.add(record.slice(separator + 1));
+  }
+  return { untracked, unmerged: [...unmerged] };
+}
+
 export function changeKindFromStatus(status: string): ChangeKind {
   switch (status[0]) {
     case 'A': return 'added';
@@ -127,6 +143,15 @@ export function changeKindFromStatus(status: string): ChangeKind {
 
 const recordKey = (path: string, previousPath?: string): string => `${previousPath ?? ''}\0${path}`;
 
+const mergeCount = (left: number | null, right: number | null): number | null =>
+  left === null || right === null ? null : left + right;
+
+const kindPriority = (kind: ChangeKind): number => {
+  if (kind === 'unmerged') return 3;
+  if (kind === 'renamed' || kind === 'copied') return 2;
+  return 1;
+};
+
 export function mergeSummaries(
   names: NameStatusRecord[],
   stats: NumstatRecord[],
@@ -135,14 +160,20 @@ export function mergeSummaries(
   const statsByPath = new Map<string, NumstatRecord>();
   for (const stat of stats) {
     const key = recordKey(stat.path, stat.previousPath);
-    if (!statsByPath.has(key)) statsByPath.set(key, stat);
+    const current = statsByPath.get(key);
+    statsByPath.set(key, current ? {
+      ...current,
+      additions: mergeCount(current.additions, stat.additions),
+      deletions: mergeCount(current.deletions, stat.deletions),
+    } : stat);
   }
   const consumedStats = new Set<string>();
-  const files = names.map((record): ChangedFileSummary => {
+  const filesByPath = new Map<string, ChangedFileSummary>();
+  for (const record of names) {
     const key = recordKey(record.path, record.previousPath);
     const stat = consumedStats.has(key) ? undefined : statsByPath.get(key);
     consumedStats.add(key);
-    return {
+    const candidate: ChangedFileSummary = {
       path: record.path,
       previousPath: record.previousPath,
       kind: changeKindFromStatus(record.status),
@@ -150,7 +181,22 @@ export function mergeSummaries(
       deletions: stat?.deletions ?? null,
       isBinary: stat?.additions === null && stat?.deletions === null,
     };
-  });
+    const current = filesByPath.get(record.path);
+    if (!current) {
+      filesByPath.set(record.path, candidate);
+      continue;
+    }
+    const preferred = kindPriority(candidate.kind) > kindPriority(current.kind) ? candidate : current;
+    const secondary = preferred === candidate ? current : candidate;
+    const isBinary = preferred.isBinary || secondary.isBinary;
+    filesByPath.set(record.path, {
+      ...preferred,
+      additions: isBinary ? null : preferred.additions ?? secondary.additions,
+      deletions: isBinary ? null : preferred.deletions ?? secondary.deletions,
+      isBinary,
+    });
+  }
+  const files = [...filesByPath.values()];
   for (const path of untracked) {
     if (!files.some(file => file.path === path)) {
       files.push({ path, kind: 'added', additions: null, deletions: null, isBinary: false });

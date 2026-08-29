@@ -278,7 +278,9 @@ async function openSession(page: Page, theme: string, opts: { highContrast?: boo
   await expect(page.locator('.pane-terminal-shell-body .xterm-screen').first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByRole('status', { name: 'Loading terminal' })).toHaveCount(0);
   // Open the single changed file as a diff tab so the add/remove tints are visible.
-  const openFile = page.getByRole('treeitem', { name: /^Open diff for frontend\/src\/contexts\/themeContextValue\.ts$/ });
+  const openFile = page.getByRole('treeitem', {
+    name: /^Open diff for frontend\/src\/contexts\/themeContextValue\.ts, Modified, \+41 −6$/,
+  });
   await expect(openFile).toBeVisible({ timeout: 15_000 });
   await openFile.click();
   await expect(page.locator('.diff-tailwindcss-wrapper').first()).toBeVisible({ timeout: 15_000 });

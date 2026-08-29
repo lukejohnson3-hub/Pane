@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DiffManifest, FileDiffRequest } from '../../../../shared/types/gitDiff';
 import { CommandRunner } from '../../utils/commandRunner';
 import { GitDiffManager } from '../gitDiffManager';
-import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ } from '../gitDiffScope';
+import { changeKindFromStatus, mergeSummaries, parseNameStatusZ, parseNumstatZ, parseWorkingTreeFilesZ } from '../gitDiffScope';
 
 const directories: string[] = [];
 const git = (cwd: string, ...args: string[]): string => execFileSync('git', args, { cwd, encoding: 'utf8' });
@@ -110,11 +110,11 @@ describe('GitDiffManager manifests', () => {
 
     expect(sortedPaths(manifest)).toEqual(['untracked-secret.txt']);
     expect(invocations).toEqual([
-      ['git', ['merge-base', 'main', 'HEAD']],
+      ['git', ['merge-base', '--end-of-options', 'main', 'HEAD']],
       ['git', ['rev-parse', '--verify', '--end-of-options', 'HEAD']],
-      ['git', ['diff', '-z', '-M', '--name-status', mergeBase]],
-      ['git', ['diff', '-z', '-M', '--numstat', mergeBase]],
-      ['git', ['ls-files', '-z', '--others', '--exclude-standard']],
+      ['git', ['diff', '-z', '-M', '--name-status', mergeBase, '--']],
+      ['git', ['diff', '-z', '-M', '--numstat', mergeBase, '--']],
+      ['git', ['ls-files', '-z', '--others', '--exclude-standard', '--unmerged', '--stage']],
     ]);
     expect(outputs.join('\n')).not.toContain(bodyMarker);
     expect(invocations.flat(2)).not.toContain('cat');
@@ -177,6 +177,24 @@ describe('GitDiffManager manifests', () => {
 
     const workingTreeRange = await manager.getDiffManifest(cwd, { kind: 'working-tree-range', baseHash: older }, runner, deps);
     expect(sortedPaths(workingTreeRange)).toEqual(['newer.txt', 'staged.txt', 'tracked.txt', 'untracked.txt']);
+  });
+
+  it('coalesces a real conflicted path into one unmerged manifest entry', async () => {
+    const cwd = repository();
+    write(cwd, 'conflict.ts', 'feature version\n');
+    commitPaths(cwd, 'feature version', ['conflict.ts']);
+    git(cwd, 'checkout', 'main');
+    write(cwd, 'conflict.ts', 'main version\n');
+    commitPaths(cwd, 'main version', ['conflict.ts']);
+    git(cwd, 'checkout', 'feature');
+    expect(() => git(cwd, 'merge', 'main')).toThrow();
+    const { manager, runner, deps } = harness(cwd);
+
+    const manifest = await manager.getDiffManifest(cwd, { kind: 'working-tree' }, runner, deps);
+
+    expect(manifest.files).toHaveLength(1);
+    expect(manifest.files[0]).toMatchObject({ path: 'conflict.ts', kind: 'unmerged' });
+    expect(manifest.stats.filesChanged).toBe(1);
   });
 });
 
@@ -291,6 +309,30 @@ describe('GitDiffManager file diffs', () => {
     expect(result).toMatchObject({ status: 'no-longer-changed', file: { path: 'vanished.txt', kind: 'added' }, patch: '' });
   });
 
+  it('ignores an unrelated renderer-supplied previous path', async () => {
+    const cwd = repository();
+    write(cwd, 'a.ts', 'a before\n');
+    write(cwd, 'b.ts', 'b before\n');
+    commitPaths(cwd, 'two files', ['a.ts', 'b.ts']);
+    write(cwd, 'a.ts', 'a after\n');
+    write(cwd, 'b.ts', 'b after\n');
+    const { manager, runner, deps } = harness(cwd);
+
+    const result = await manager.getFileDiff(
+      cwd,
+      { kind: 'working-tree' },
+      { path: 'a.ts', previousPath: 'b.ts' },
+      runner,
+      deps,
+    );
+
+    expect(result).toMatchObject({ status: 'changed', file: { path: 'a.ts', kind: 'modified' } });
+    expect(result.file.previousPath).toBeUndefined();
+    expect(result.patch).toContain('a.ts');
+    expect(result.patch).not.toContain('b.ts');
+    expect(result.patch).not.toContain('b after');
+  });
+
   it.each([
     ['', 'empty'],
     ['../outside.txt', 'parent-relative'],
@@ -314,5 +356,28 @@ describe('NUL parsers', () => {
       { path: '[odd]?.bin', previousPath: undefined, kind: 'modified', additions: null, deletions: null, isBinary: true },
     ]);
     expect(changeKindFromStatus('U')).toBe('unmerged');
+  });
+
+  it('coalesces duplicate conflict records and prefers the unmerged kind', () => {
+    expect(mergeSummaries(
+      parseNameStatusZ('M\0conflict.ts\0U\0conflict.ts\0'),
+      parseNumstatZ('1\t2\tconflict.ts\0' + '3\t4\tconflict.ts\0'),
+      [],
+    )).toEqual([{
+      path: 'conflict.ts',
+      previousPath: undefined,
+      kind: 'unmerged',
+      additions: 4,
+      deletions: 6,
+      isBinary: false,
+    }]);
+  });
+
+  it('separates staged unmerged records from untracked paths', () => {
+    expect(parseWorkingTreeFilesZ(
+      '100644 deadbeef 1\tconflict.ts\0'
+      + '100644 cafebabe 2\tconflict.ts\0'
+      + 'untracked.ts\0',
+    )).toEqual({ unmerged: ['conflict.ts'], untracked: ['untracked.ts'] });
   });
 });
