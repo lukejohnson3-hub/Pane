@@ -1,9 +1,9 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, FileText, Folder } from 'lucide-react';
-import type { ChangedFileSummary, DiffManifest } from '../../../../../shared/types/gitDiff';
+import type { ChangedFileSummary } from '../../../../../shared/types/gitDiff';
 import { cn } from '../../../utils/cn';
 import { useScrollSurface } from '../../../hooks/useScrollSurface';
-import { buildChangesTree, compactChains, flattenRows, navigate, revealPath, typeAhead } from './changesTreeModel';
+import { flattenRows, navigate, typeAhead, type ChangesTreeNode } from './changesTreeModel';
 
 const ROW_HEIGHT = 32;
 const OVERSCAN = 8;
@@ -21,7 +21,7 @@ const accessibleFileLabel = (file: ChangedFileSummary): string => {
 
 export const ChangesTree = memo(function ChangesTree({
   sessionId,
-  manifest,
+  tree,
   scopeKey,
   activePath,
   expanded,
@@ -29,7 +29,7 @@ export const ChangesTree = memo(function ChangesTree({
   onFileOpen,
 }: {
   sessionId: string;
-  manifest: DiffManifest;
+  tree: ChangesTreeNode;
   scopeKey: string;
   activePath: string | null;
   expanded: ReadonlySet<string>;
@@ -42,7 +42,6 @@ export const ChangesTree = memo(function ChangesTree({
   const [activeIndex, setActiveIndex] = useState(0);
   const typeBuffer = useRef('');
   const typeTimer = useRef<number | null>(null);
-  const tree = useMemo(() => compactChains(buildChangesTree(manifest.files)), [manifest.files]);
   const rows = useMemo(() => flattenRows(tree, expanded), [tree, expanded]);
   const treeId = useMemo(() => `changes-tree-${sessionId.replace(/[^a-zA-Z0-9_-]/g, '-')}-${scopeKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`, [scopeKey, sessionId]);
   const ownerElement = useCallback(() => hostRef.current, []);
@@ -72,11 +71,9 @@ export const ChangesTree = memo(function ChangesTree({
 
   useEffect(() => {
     if (!activePath) return;
-    const revealed = revealPath(expanded, tree, activePath);
-    if ([...revealed].some(id => !expanded.has(id))) onExpandedChange(revealed);
     const index = rows.findIndex(row => row.file?.path === activePath);
     if (index >= 0) setActiveIndex(index);
-  }, [activePath, expanded, onExpandedChange, rows, tree]);
+  }, [activePath, rows]);
 
   const visibleStart = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
   const visibleEnd = Math.min(rows.length, Math.ceil((scrollTop + height) / ROW_HEIGHT) + OVERSCAN);

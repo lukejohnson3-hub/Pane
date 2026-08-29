@@ -8,8 +8,8 @@ import { CommitDialog } from '../../CommitDialog';
 import { editorPanelState, openFileInEditor } from '../../../services/openFileInEditor';
 import { usePanelStore } from '../../../stores/panelStore';
 import { ChangesTree } from './ChangesTree';
-import { buildChangesTree, compactChains, defaultExpanded, reconcileExpanded } from './changesTreeModel';
-import { editorDiffRefForFile, isMutableScope, scopeKey, scopeLabel } from './diffScope';
+import { buildChangesTree, compactChains, defaultExpanded, reconcileExpanded, revealPath, type ChangesTreeNode } from './changesTreeModel';
+import { editorDiffRefForFile, isMutableScope, normalizeEditorDiffRef, sameScope, scopeKey, scopeLabel } from './diffScope';
 import { clearPendingViewCommit, takePendingViewCommit } from './pendingViewCommit';
 
 const HISTORY_LIMIT = 50;
@@ -21,6 +21,12 @@ const SESSION_SCOPE: DiffScope = { kind: 'session' };
 
 export interface CombinedDiffViewHandle { refresh: () => void }
 
+/** One loaded scope: the request-side scope, its manifest, and the tree derived from it exactly once. */
+interface LoadedScope { key: string; scope: DiffScope; manifest: DiffManifest; tree: ChangesTreeNode }
+
+const loadScope = (key: string, scope: DiffScope, manifest: DiffManifest): LoadedScope =>
+  ({ key, scope, manifest, tree: compactChains(buildChangesTree(manifest.files)) });
+
 const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffViewProps>(function CombinedDiffView({
   sessionId,
   isGitOperationRunning = false,
@@ -28,11 +34,9 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   isVisible = true,
 }, ref) {
   const [executions, setExecutions] = useState<ExecutionDiff[]>([]);
-  const [scopeState, setScopeState] = useState<{ sessionId: string; scope: DiffScope }>(() => ({
-    sessionId,
-    scope: SESSION_SCOPE,
-  }));
-  const [manifest, setManifest] = useState<DiffManifest | null>(null);
+  // The mount site keys this component by session, so per-session state starts fresh on a switch.
+  const [scope, setScope] = useState<DiffScope>(SESSION_SCOPE);
+  const [display, setDisplay] = useState<LoadedScope | null>(null);
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
   const [executionsLoading, setExecutionsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -49,55 +53,43 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
       : width;
   });
   const [isResizing, setIsResizing] = useState(false);
-  const manifestCache = useRef(new Map<string, DiffManifest>());
-  const manifestTreeCache = useRef(new Map<string, ReturnType<typeof compactChains>>());
+  const scopeCache = useRef(new Map<string, LoadedScope>());
+  // Survives refresh eviction so a refetched mutable scope can reconcile its expansion state.
+  const lastTreeByKey = useRef(new Map<string, ChangesTreeNode>());
   const requestId = useRef(0);
   const executionRequestId = useRef(0);
-  const displayedKey = useRef<string | null>(null);
 
-  const scope = scopeState.sessionId === sessionId ? scopeState.scope : SESSION_SCOPE;
-  const setScope = useCallback((next: DiffScope) => {
-    setScopeState({ sessionId, scope: next });
-  }, [sessionId]);
   const key = `${sessionId}:${scopeKey(scope)}`;
   const expanded = expandedByScope[key] ?? new Set<string>();
-  const visibleManifest = displayedKey.current === key ? manifest : null;
-  const loading = loadingKey === key || (visibleManifest === null && error === null);
+  const visible = display?.key === key ? display : null;
+  const visibleManifest = visible?.manifest ?? null;
+  const loading = loadingKey === key || (visible === null && error === null);
 
+  // Only a diff tab whose scope matches the tree's scope counts as the active file.
   const activeDiffPath = usePanelStore((state) => {
     const activeId = state.activePanels[sessionId];
     const active = (state.panels[sessionId] || []).find(panel => panel.id === activeId);
     const editor = active ? editorPanelState(active) : undefined;
-    return editor?.diff ? editor.filePath : null;
+    if (!editor?.diff) return null;
+    const normalized = normalizeEditorDiffRef(editor.diff);
+    return normalized && sameScope(normalized.scope, scope) ? editor.filePath : null;
   });
 
   const refresh = useCallback(() => {
-    const prefix = `${sessionId}:`;
-    for (const [cacheKey, cached] of manifestCache.current) {
-      if (cacheKey.startsWith(prefix) && isMutableScope(cached.scope)) {
-        manifestCache.current.delete(cacheKey);
-      }
+    for (const [cacheKey, cached] of scopeCache.current) {
+      if (isMutableScope(cached.scope)) scopeCache.current.delete(cacheKey);
     }
     requestId.current += 1;
     setRefreshNonce(value => value + 1);
-  }, [sessionId]);
+  }, []);
 
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
   useEffect(() => {
-    setScope(SESSION_SCOPE);
-    setManifest(null);
-    setExecutions([]);
-    setExpandedByScope({});
-    manifestCache.current.clear();
-    manifestTreeCache.current.clear();
-    requestId.current += 1;
-    executionRequestId.current += 1;
-    displayedKey.current = null;
-    setLoadingKey(null);
-    setMainBranch('main');
-    setHistorySource(isMainRepo ? 'remote' : 'branch');
-  }, [isMainRepo, sessionId, setScope]);
+    if (!activeDiffPath || !visible) return;
+    const revealed = revealPath(expanded, visible.tree, activeDiffPath);
+    if (revealed.size !== expanded.size) setExpandedByScope(previous => ({ ...previous, [key]: revealed }));
+  }, [activeDiffPath, expanded, key, visible]);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarWidth.toString());
@@ -179,30 +171,26 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
   useEffect(() => {
     if (!isVisible) return;
     const owned = ++requestId.current;
-    const cached = manifestCache.current.get(key);
+    const cached = scopeCache.current.get(key);
     if (cached) {
-      setManifest(cached);
-      displayedKey.current = key;
+      setDisplay(cached);
       setLoadingKey(null);
       setError(null);
       return;
     }
-    if (displayedKey.current !== key) setManifest(null);
     setLoadingKey(key);
     setError(null);
     void API.sessions.getDiffManifest(sessionId, scope).then(response => {
       if (owned !== requestId.current) return;
       if (!response.success || !response.data) throw new Error(response.error || 'Failed to load changes');
-      const data = response.data;
-      manifestCache.current.set(key, data);
-      setManifest(data);
-      displayedKey.current = key;
-      const tree = compactChains(buildChangesTree(data.files));
-      const previousTree = manifestTreeCache.current.get(key);
-      manifestTreeCache.current.set(key, tree);
+      const loaded = loadScope(key, scope, response.data);
+      scopeCache.current.set(key, loaded);
+      const previousTree = lastTreeByKey.current.get(key);
+      lastTreeByKey.current.set(key, loaded.tree);
+      setDisplay(loaded);
       setExpandedByScope(previous => ({
         ...previous,
-        [key]: previous[key] ? reconcileExpanded(previous[key], tree, previousTree) : defaultExpanded(tree),
+        [key]: previous[key] ? reconcileExpanded(previous[key], loaded.tree, previousTree) : defaultExpanded(loaded.tree),
       }));
     }).catch(cause => {
       if (owned === requestId.current) setError(cause instanceof Error ? cause.message : 'Failed to load changes');
@@ -310,7 +298,7 @@ const CombinedDiffView = memo(forwardRef<CombinedDiffViewHandle, CombinedDiffVie
             </div>
           ) : loading && !visibleManifest ? <div className="animate-pulse p-4 text-sm text-text-secondary">Loading {label}…</div>
             : error ? <div role="alert" className="m-4 rounded border border-status-error/30 bg-status-error/10 p-4 text-sm text-status-error">{error}</div>
-              : visibleManifest && visibleManifest.files.length > 0 ? <ChangesTree sessionId={sessionId} manifest={visibleManifest} scopeKey={scopeKey(scope)} activePath={activeDiffPath} expanded={expanded} onExpandedChange={next => setExpandedByScope(previous => ({ ...previous, [key]: next }))} onFileOpen={handleFileOpen} />
+              : visible && visible.manifest.files.length > 0 ? <ChangesTree sessionId={sessionId} tree={visible.tree} scopeKey={scopeKey(scope)} activePath={activeDiffPath} expanded={expanded} onExpandedChange={next => setExpandedByScope(previous => ({ ...previous, [key]: next }))} onFileOpen={handleFileOpen} />
                 : <div className="flex h-full items-center justify-center text-sm text-text-secondary"><div className="space-y-2 text-center"><p>{emptyMessage}</p>{isMainRepo && historySource === 'remote' && <p className="text-sm text-text-tertiary">Create new commits to see them here.</p>}</div></div>}
         </div>
       </div>

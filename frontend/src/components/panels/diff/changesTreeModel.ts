@@ -99,9 +99,8 @@ export function reconcileExpanded(
 ): Set<string> {
   const current = new Set(folderIds(tree));
   const prior = new Set(previousTree ? folderIds(previousTree) : []);
-  const collapsedPaths = [...prior]
-    .filter(id => !previous.has(id) && !current.has(id))
-    .map(id => id.slice(2));
+  const collapsedPaths: string[] = [];
+  for (const id of prior) if (!previous.has(id) && !current.has(id)) collapsedPaths.push(id.slice(2));
   return new Set([...current].filter(id => {
     const path = id.slice(2);
     const belowCollapsedAncestor = collapsedPaths.some(collapsed =>
