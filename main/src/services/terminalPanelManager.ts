@@ -35,9 +35,9 @@ const MAX_CONCURRENT_SPAWNS = 3;
 // that accumulates panes accumulates shells indefinitely. On Windows each
 // Git-Bash terminal is a three-process chain, and four days of use reached
 // 2,260 `bash.exe` holding 10.3 GB before the machine could not fork.
-const MAX_LIVE_TERMINALS = 32;
+export const MAX_LIVE_TERMINALS = 32;
 // A hidden terminal must be quiet this long before it is a suspension candidate.
-const TERMINAL_IDLE_SUSPEND_MS = 15 * 60_000;
+export const TERMINAL_IDLE_SUSPEND_MS = 15 * 60_000;
 const AGENT_STATUS_POLL_MS = 500; // cadence for re-deriving blocked/working/done from the live screen
 const MAX_SCROLLBACK_BUFFER_SIZE = 500_000; // 500KB of normal shell history
 const MAX_ALTERNATE_SCREEN_BUFFER_SIZE = 100_000; // 100KB of recent TUI redraw state
@@ -54,7 +54,7 @@ const SHELL_PROMPT_FALLBACK_MS = 5000;
 // practice; the cap is a backstop against pathological payloads.
 const MAX_RESTORE_PAYLOAD_SIZE = 512 * 1024;
 
-import { CliAgentType, resolveAgentTypeFromCommand } from './agents/agentIdentity';
+import { CliAgentType, isCliAgentType, resolveAgentTypeFromCommand } from './agents/agentIdentity';
 import { buildCursorLaunchCommand, createCursorReadyDetector, extractCursorChatId } from './agents/cursorLaunch';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -240,6 +240,8 @@ export class TerminalPanelManager {
   private terminals = new Map<string, TerminalProcess>();
   private serializedBuffers = new Map<string, string>();
   private readonly visibleViewersByPanel = new Map<string, Map<string, number>>();
+  /** Session the user is looking at; never a suspension candidate. */
+  private activeSessionId: string | null = null;
   private readonly MAX_SCROLLBACK_LINES = 10000;
   private analyticsManager: AnalyticsManager | null = null;
 
@@ -594,22 +596,45 @@ export class TerminalPanelManager {
   }
 
   /**
+   * Record which session the user is currently looking at.
+   *
+   * Suspension needs a signal that survives the window losing focus. In
+   * `batterySaver` power mode a blur marks every terminal hidden
+   * (`TerminalPanel.tsx`), so `isVisible` alone would make the pane on screen a
+   * candidate. The active session never changes on blur.
+   */
+  setActiveSession(sessionId: string | null): void {
+    this.activeSessionId = sessionId;
+  }
+
+  /**
    * Reclaim PTY slots so `MAX_LIVE_TERMINALS` holds.
    *
-   * Every other budget in this class caps bytes — scrollback, the alternate
-   * screen, the 64MB serialized-snapshot pool — and none caps processes.
+   * Every other budget in this class counts bytes — scrollback, the alternate
+   * screen, the 64MB serialized-snapshot pool — and none counts processes.
    * `MAX_CONCURRENT_SPAWNS` throttles how fast shells appear, not how many
    * stay. This is the missing one.
    *
    * Suspending a terminal is what Pane already does to every terminal on
-   * restart: save state, kill the PTY, re-initialize lazily on next view. The
-   * guards below exist so it can never do the one thing a restart does do —
-   * kill an agent mid-turn. A panel is a candidate only when no viewer has it
-   * open, it has produced nothing for `TERMINAL_IDLE_SUSPEND_MS`, and either no
-   * agent is tracked on it or that agent has settled to `idle`. `working` and
-   * `blocked` are both live turns and are never touched.
+   * restart: mark the panel interrupted, save state, kill the PTY, and
+   * re-initialize lazily on next view, which resumes the agent. The guards
+   * exist so it can never do the one thing a restart does do — kill an agent
+   * mid-turn. A candidate must be all of:
    *
-   * Fails open: if nothing is evictable the new terminal still spawns, because
+   * - not in the session the user is looking at, so a blurred window in
+   *   `batterySaver` mode cannot make the visible pane a target;
+   * - hidden, i.e. mounted in no renderer;
+   * - settled to `idle` by the status monitor. Note this is `=== 'idle'`, not
+   *   `!== 'working'`: every panel is registered (see
+   *   `registerAgentStatusPanel`), and `getState` returns `undefined` both
+   *   before the first publish and while an agent-owned viewer holds the state
+   *   (`AgentStatusMonitor.update` early-returns on `skipStateUpdate`), so
+   *   `undefined` is "unknown", never "no agent here";
+   * - quiet for `TERMINAL_IDLE_SUSPEND_MS`. `lastActivity` only advances on PTY
+   *   bytes, so a genuinely silent agent rests on its manifest publishing
+   *   `working`; the idle window is the backstop for that.
+   *
+   * Fails open: if nothing qualifies the new terminal still spawns, because
    * refusing to open a terminal is worse than exceeding the ceiling.
    */
   private suspendIdleTerminals(now: number = Date.now()): void {
@@ -618,8 +643,8 @@ export class TerminalPanelManager {
     const candidates: Array<{ panelId: string; idleMs: number }> = [];
     for (const [panelId, terminal] of this.terminals) {
       if (terminal.isVisible) continue;
-      const agentState = this.agentStatusMonitor.getState(panelId);
-      if (agentState !== undefined && agentState !== 'idle') continue;
+      if (this.activeSessionId !== null && terminal.sessionId === this.activeSessionId) continue;
+      if (this.agentStatusMonitor.getState(panelId) !== 'idle') continue;
       const idleMs = now - terminal.lastActivity.getTime();
       if (idleMs < TERMINAL_IDLE_SUSPEND_MS) continue;
       candidates.push({ panelId, idleMs });
@@ -627,7 +652,7 @@ export class TerminalPanelManager {
 
     if (candidates.length === 0) {
       console.warn(
-        `[TerminalPanelManager] ${this.terminals.size} live terminals at the ${MAX_LIVE_TERMINALS} ceiling, none suspendable (all visible, mid-turn, or active within ${TERMINAL_IDLE_SUSPEND_MS / 60_000}m) — spawning anyway`
+        `[TerminalPanelManager] ${this.terminals.size} live terminals at the ${MAX_LIVE_TERMINALS} ceiling, none suspendable (visible, in the active session, mid-turn, or active within ${TERMINAL_IDLE_SUSPEND_MS / 60_000}m) — spawning anyway`
       );
       return;
     }
@@ -639,8 +664,39 @@ export class TerminalPanelManager {
       console.log(
         `[TerminalPanelManager] Suspending idle terminal ${panelId} (hidden, quiet ${Math.round(idleMs / 60_000)}m) to stay under the ${MAX_LIVE_TERMINALS}-terminal ceiling`
       );
-      this.destroyTerminal(panelId);
+      try {
+        this.markPanelInterrupted(panelId);
+        this.destroyTerminal(panelId);
+      } catch (error) {
+        // One bad terminal must not abort the pass or escape into
+        // `initializeTerminal`, whose `finally` owns the spawn slot.
+        console.error(`[TerminalPanelManager] Failed to suspend terminal ${panelId}:`, error);
+      }
     }
+  }
+
+  /**
+   * Flag a CLI-agent panel so its next launch resumes instead of starting over.
+   *
+   * Mirrors the shutdown path in `index.ts`. Codex and Cursor gate resume
+   * solely on `wasInterrupted` (`resolveCodexLaunch` / `resolveCursorLaunch`),
+   * so without this a suspended panel comes back as an empty conversation.
+   * The mutation is synchronous, and `destroyTerminal`'s `saveTerminalState`
+   * spreads the existing custom state, so it persists.
+   */
+  private markPanelInterrupted(panelId: string): void {
+    const terminal = this.terminals.get(panelId);
+    if (!terminal) return;
+    const panel = panelManager.getPanel(panelId);
+    if (!panel) return;
+
+    const customState = terminalCustomState(panel.state);
+    const agentType = terminal.agentType
+      ?? customState.agentType
+      ?? resolveAgentTypeFromCommand(customState.initialCommand);
+    if (!isCliAgentType(agentType)) return;
+
+    panel.state.customState = { ...customState, wasInterrupted: true, agentType };
   }
 
   private async acquireSpawnSlot(priority: number = 1): Promise<void> {
@@ -960,10 +1016,12 @@ export class TerminalPanelManager {
       return;
     }
 
-    // Bound the resident PTY count before adding one more.
-    this.suspendIdleTerminals();
-
     try {
+
+    // Bound the resident PTY count before adding one more. Inside the `try`
+    // because `finally` releases the spawn slot; a throw out here would leak
+    // one permanently and, three times over, deadlock all terminal creation.
+    this.suspendIdleTerminals();
 
     let shellPath: string;
     let shellArgs: string[];
@@ -1258,6 +1316,14 @@ export class TerminalPanelManager {
   private setupTerminalHandlers(terminal: TerminalProcess): void {
     // Handle terminal output
     terminal.pty.onData((data: string) => {
+      // Identity guard: this closure outlives its PTY. `destroyTerminal`
+      // (suspension, panel delete, archive) removes the entry and kills the
+      // process, but a late callback can still arrive — for WSL the kill is
+      // deferred 500ms, and under ptyHost the exit round-trips a UtilityProcess.
+      // By then the panel may hold a freshly spawned terminal, and acting on
+      // `terminal.panelId` would hit that live one instead.
+      if (this.terminals.get(terminal.panelId) !== terminal) return;
+
       // Update last activity
       const outputAt = new Date();
       terminal.lastActivity = outputAt;
@@ -1353,6 +1419,14 @@ export class TerminalPanelManager {
     
     // Handle terminal exit
     terminal.pty.onExit((exitCode: { exitCode: number; signal?: number }) => {
+      // Identity guard: this closure outlives its PTY. `destroyTerminal`
+      // (suspension, panel delete, archive) removes the entry and kills the
+      // process, but a late callback can still arrive — for WSL the kill is
+      // deferred 500ms, and under ptyHost the exit round-trips a UtilityProcess.
+      // By then the panel may hold a freshly spawned terminal, and acting on
+      // `terminal.panelId` would hit that live one instead.
+      if (this.terminals.get(terminal.panelId) !== terminal) return;
+
       // A finished agent is "done": settle its status to idle and stop tracking.
       if (this.agentStatusMonitor.isTracked(terminal.panelId)) {
         this.emitAgentStatus(terminal, 'idle', 'exit');
@@ -1818,8 +1892,13 @@ export class TerminalPanelManager {
       return;
     }
 
-    // Save state before destroying
-    this.saveTerminalState(panelId);
+    // Save state before destroying. Deliberately not awaited — the emulator
+    // preserves its final buffer across `dispose()`, so the snapshot is still
+    // correct when this settles. It must not reject unhandled now that
+    // suspension puts this on an automatic path.
+    this.saveTerminalState(panelId).catch((error) => {
+      console.error(`[TerminalPanelManager] Failed to save state for ${panelId}:`, error);
+    });
 
     // Clear timers
     if (terminal.outputFlushTimer) {
@@ -1827,7 +1906,15 @@ export class TerminalPanelManager {
       terminal.outputFlushTimer = null;
     }
     disposeFlowControlRecord(terminal.flowControl);
-    this.flushOutputBuffer(terminal);
+    try {
+      // The event-sink fanout rethrows the first subscriber error, so one
+      // destroyed webContents or one bad daemon client can throw here. That
+      // must not strand the terminal in `this.terminals` with its PTY already
+      // half torn down — suspension would then re-select it on every pass.
+      this.flushOutputBuffer(terminal);
+    } catch (error) {
+      console.warn(`[TerminalPanelManager] Final output flush failed for ${panelId}:`, error);
+    }
     terminal.screenEmulator?.dispose();
 
     // Kill the PTY process

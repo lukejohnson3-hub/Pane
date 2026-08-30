@@ -1786,6 +1786,8 @@ export function registerSessionHandlers(
     try {
       // Notify GitStatusManager about the active session change
       gitStatusManager.setActiveSession(sessionId);
+      // TerminalPanelManager never suspends a terminal in the active session.
+      terminalPanelManager.setActiveSession(sessionId);
       return { success: true };
     } catch (error) {
       console.error('Failed to set active session:', error);

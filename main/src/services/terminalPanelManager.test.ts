@@ -5,7 +5,7 @@ import { createFlowControlRecord, disposeFlowControlRecord, type FlowControlReco
 import { TerminalStateEmulator } from './terminalStateEmulator';
 import type { TerminalPanelState } from '../../../shared/types/panels';
 
-import { TerminalPanelManager } from './terminalPanelManager';
+import { MAX_LIVE_TERMINALS, TERMINAL_IDLE_SUSPEND_MS, TerminalPanelManager } from './terminalPanelManager';
 import { panelManager } from '../test/setup';
 
 vi.spyOn(panelManager, 'emitPanelEvent');
@@ -97,7 +97,9 @@ type AgentSessionCaptureAccess = {
 type SuspendIdleAccess = {
   terminals: Map<string, TerminalUnderTest>;
   agentStatusMonitor: { getState(panelId: string): string | undefined };
+  setActiveSession(sessionId: string | null): void;
   suspendIdleTerminals(now?: number): void;
+  flushOutputBuffer(terminal: TerminalUnderTest): void;
 };
 
 type ShellPromptSchedulerAccess = {
@@ -1015,15 +1017,19 @@ describe('TerminalPanelManager agent session capture', () => {
 });
 
 describe('TerminalPanelManager live-terminal ceiling', () => {
-  const CEILING = 32;
-  const IDLE_MS = 15 * 60_000;
   const NOW = 1_800_000_000_000;
 
   afterEach(() => {
     vi.mocked(panelManager.getPanel).mockReset();
     vi.mocked(panelManager.updatePanel).mockReset();
+    vi.restoreAllMocks();
   });
 
+  /**
+   * Fills the manager with terminals that all satisfy every guard, so a test can
+   * knock out exactly one condition and watch it protect that panel. Idleness
+   * grows with the index, so the highest index is always the first candidate.
+   */
   function fill(
     manager: SuspendIdleAccess,
     count: number,
@@ -1033,62 +1039,142 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
       const panelId = `panel-${i}`;
       manager.terminals.set(panelId, createTerminal({
         panelId,
+        sessionId: `session-${i}`,
         isVisible: false,
-        lastActivity: new Date(NOW - IDLE_MS - 1000 - i),
+        lastActivity: new Date(NOW - TERMINAL_IDLE_SUSPEND_MS - 1000 - i),
         ...overridesFor(i),
       }));
     }
   }
 
+  function stubAgentStates(manager: SuspendIdleAccess, byPanel: Record<string, string> = {}): void {
+    vi.spyOn(manager.agentStatusMonitor, 'getState').mockImplementation(
+      (panelId: string) => byPanel[panelId] ?? 'idle',
+    );
+  }
+
   it('leaves every terminal alone below the ceiling', () => {
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    fill(manager, CEILING - 1);
+    fill(manager, MAX_LIVE_TERMINALS - 1);
+    stubAgentStates(manager);
 
     manager.suspendIdleTerminals(NOW);
 
-    expect(manager.terminals.size).toBe(CEILING - 1);
+    expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS - 1);
   });
 
-  it('suspends the longest-idle hidden terminal, and only enough to get back under', () => {
+  it('kills the PTY of the longest-idle terminal, and only enough to get back under', () => {
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    fill(manager, CEILING);
+    fill(manager, MAX_LIVE_TERMINALS);
+    stubAgentStates(manager);
+    const oldest = manager.terminals.get(`panel-${MAX_LIVE_TERMINALS - 1}`);
+    const survivor = manager.terminals.get('panel-0');
 
     manager.suspendIdleTerminals(NOW);
 
-    // panel-31 is the oldest (lastActivity decreases as the index grows).
-    expect(manager.terminals.has('panel-31')).toBe(false);
-    expect(manager.terminals.size).toBe(CEILING - 1);
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 1}`)).toBe(false);
+    // Dropping it from the map is not enough — the process has to actually die.
+    expect(oldest?.pty.kill).toHaveBeenCalled();
+    expect(survivor?.pty.kill).not.toHaveBeenCalled();
+    expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS - 1);
   });
 
-  it('never suspends a visible terminal, a live agent turn, or a recently active one', () => {
+  it('never suspends a visible terminal, a working or blocked agent, or the active session', () => {
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    fill(manager, CEILING, (i) => {
-      if (i === CEILING - 1) return { isVisible: true };
-      if (i === CEILING - 2) return { lastActivity: new Date(NOW - 1000) };
-      return {};
-    });
-    vi.spyOn(manager.agentStatusMonitor, 'getState').mockImplementation(
-      (panelId: string) => (panelId === `panel-${CEILING - 3}` ? 'working' : undefined),
-    );
+    const visible = `panel-${MAX_LIVE_TERMINALS - 1}`;
+    const working = `panel-${MAX_LIVE_TERMINALS - 2}`;
+    const blocked = `panel-${MAX_LIVE_TERMINALS - 3}`;
+    const active = `panel-${MAX_LIVE_TERMINALS - 4}`;
+    fill(manager, MAX_LIVE_TERMINALS, (i) => (i === MAX_LIVE_TERMINALS - 1 ? { isVisible: true } : {}));
+    stubAgentStates(manager, { [working]: 'working', [blocked]: 'blocked' });
+    manager.setActiveSession(`session-${MAX_LIVE_TERMINALS - 4}`);
 
     manager.suspendIdleTerminals(NOW);
 
-    expect(manager.terminals.has(`panel-${CEILING - 1}`)).toBe(true);
-    expect(manager.terminals.has(`panel-${CEILING - 2}`)).toBe(true);
-    expect(manager.terminals.has(`panel-${CEILING - 3}`)).toBe(true);
-    // The longest-idle candidate that passes every guard.
-    expect(manager.terminals.has(`panel-${CEILING - 4}`)).toBe(false);
+    expect(manager.terminals.has(visible)).toBe(true);
+    expect(manager.terminals.has(working)).toBe(true);
+    expect(manager.terminals.has(blocked)).toBe(true);
+    expect(manager.terminals.has(active)).toBe(true);
+    // The longest-idle candidate that clears every guard.
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 5}`)).toBe(false);
+  });
+
+  it('never suspends a panel whose agent status has not published yet', () => {
+    // Every panel is registered with the monitor, so `undefined` means "unknown",
+    // not "no agent here" — a freshly launched agent reads this way before its
+    // first publish, and so does one parked in an agent-owned viewer.
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS);
+    vi.spyOn(manager.agentStatusMonitor, 'getState').mockReturnValue(undefined);
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS);
+  });
+
+  it('never suspends a terminal quiet for less than the idle window', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    // Every guard satisfied except the window: hidden and idle-stated, but all
+    // active a second ago. Without the window check these are all evictable.
+    fill(manager, MAX_LIVE_TERMINALS, () => ({ lastActivity: new Date(NOW - 1000) }));
+    stubAgentStates(manager);
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS);
   });
 
   it('fails open when nothing is suspendable', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    fill(manager, CEILING, () => ({ isVisible: true }));
+    fill(manager, MAX_LIVE_TERMINALS, () => ({ isVisible: true }));
+    stubAgentStates(manager);
 
     manager.suspendIdleTerminals(NOW);
 
-    expect(manager.terminals.size).toBe(CEILING);
+    expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('none suspendable'));
-    warn.mockRestore();
+  });
+
+  it('marks a suspended CLI panel interrupted so its next launch resumes', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS);
+    stubAgentStates(manager);
+    const oldest = `panel-${MAX_LIVE_TERMINALS - 1}`;
+    const panelState = { customState: { agentType: 'codex' } };
+    vi.mocked(panelManager.getPanel).mockImplementation((panelId: string) => (
+      // SAFETY: markPanelInterrupted reads only `state.customState` off the panel.
+      panelId === oldest ? ({ id: oldest, state: panelState } as ReturnType<typeof panelManager.getPanel>) : undefined
+    ));
+
+    manager.suspendIdleTerminals(NOW);
+
+    // Codex and Cursor resume only when this is set; without it they restart empty.
+    expect(panelState.customState).toMatchObject({ wasInterrupted: true, agentType: 'codex' });
+  });
+
+  it('still releases a terminal whose final output flush throws', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS);
+    stubAgentStates(manager);
+    const oldest = `panel-${MAX_LIVE_TERMINALS - 1}`;
+    const doomed = manager.terminals.get(oldest);
+    // The production event-sink fanout rethrows its first subscriber error.
+    vi.spyOn(manager, 'flushOutputBuffer').mockImplementation((terminal) => {
+      if (terminal.panelId === oldest) throw new Error('event sink exploded');
+    });
+
+    // Must not escape: initializeTerminal calls this inside the try whose
+    // finally releases the spawn slot.
+    expect(() => manager.suspendIdleTerminals(NOW)).not.toThrow();
+
+    // And the terminal must still be gone, or every later pass re-picks it.
+    expect(manager.terminals.has(oldest)).toBe(false);
+    expect(doomed?.pty.kill).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('Final output flush failed'),
+      expect.anything(),
+    );
   });
 });

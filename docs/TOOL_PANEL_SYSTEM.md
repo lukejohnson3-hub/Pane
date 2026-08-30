@@ -16,7 +16,10 @@ The tool panel system consists of several key components:
 
 1. **Lazy Initialization**: Panels are created in the database immediately but background processes (like terminal PTY) only start when the panel is first viewed
 2. **State Persistence**: All panel state including terminal scrollback, working directories, and configurations persist across application restarts
-3. **Memory Efficiency**: Inactive panels suspend rendering but maintain background processes
+3. **Bounded Resources**: Inactive panels suspend rendering, and their background processes are
+   bounded rather than unlimited. At most `MAX_LIVE_TERMINALS` terminal PTYs stay resident;
+   past that, the longest-idle terminal is suspended and re-initialized on its next view
+   (see `main/src/services/terminalPanelManager.ts`)
 4. **Event-Driven Updates**: Uses IPC events to synchronize state between main and renderer processes
 5. **Extensible Design**: Architecture supports future panel types beyond terminals
 
@@ -25,8 +28,13 @@ The tool panel system consists of several key components:
 1. **Creation**: User clicks "Add Tool" → Panel entry created in database → Added to UI
 2. **First View**: User clicks panel tab → Background process initializes → XTerm.js mounts
 3. **Switching**: User switches panels → Previous panel unmounts XTerm → New panel mounts
-4. **Background Operation**: Processes continue running even when panel is not visible
-5. **Deletion**: Panel closed → Process terminated → Database entry removed → UI updated
+4. **Background Operation**: Processes keep running while a panel is hidden, but not forever.
+   A terminal is suspended when the resident count reaches `MAX_LIVE_TERMINALS` and it is
+   hidden, outside the active session, settled to `idle`, and quiet for
+   `TERMINAL_IDLE_SUSPEND_MS`. Panel state is saved first and CLI-agent panels are marked
+   `wasInterrupted`, so the next view restores scrollback and resumes the agent
+5. **Suspension**: Ceiling reached → State saved → PTY killed → Panel re-initializes on next view
+6. **Deletion**: Panel closed → Process terminated → Database entry removed → UI updated
 
 ## Terminal Panel Specifics
 
