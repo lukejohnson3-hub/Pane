@@ -672,7 +672,7 @@ export class TerminalPanelManager {
 
     if (candidates.length === 0) {
       console.warn(
-        `[TerminalPanelManager] ${this.terminals.size} live terminals at the ${MAX_LIVE_TERMINALS} ceiling, none suspendable (visible, in the active session, mid-turn, or active within ${TERMINAL_IDLE_SUSPEND_MS / 60_000}m) — spawning anyway`
+        `[TerminalPanelManager] ${this.terminals.size} live terminals at the ${MAX_LIVE_TERMINALS} ceiling, none suspendable (visible, in a session seen on screen, mid-turn, or active within ${TERMINAL_IDLE_SUSPEND_MS / 60_000}m) — spawning anyway`
       );
       return;
     }
