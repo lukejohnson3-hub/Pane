@@ -97,9 +97,9 @@ type AgentSessionCaptureAccess = {
 type SuspendIdleAccess = {
   terminals: Map<string, TerminalUnderTest>;
   agentStatusMonitor: { getState(panelId: string): string | undefined };
-  setActiveSession(sessionId: string | null): void;
   suspendIdleTerminals(now?: number): void;
   flushOutputBuffer(terminal: TerminalUnderTest): void;
+  setVisibility(panelId: string, isVisible: boolean, viewerId?: string): void;
 };
 
 type ShellPromptSchedulerAccess = {
@@ -1079,24 +1079,43 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     expect(manager.terminals.size).toBe(MAX_LIVE_TERMINALS - 1);
   });
 
-  it('never suspends a visible terminal, a working or blocked agent, or the active session', () => {
+  it('never suspends a visible terminal or a working or blocked agent', () => {
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
     const visible = `panel-${MAX_LIVE_TERMINALS - 1}`;
     const working = `panel-${MAX_LIVE_TERMINALS - 2}`;
     const blocked = `panel-${MAX_LIVE_TERMINALS - 3}`;
-    const active = `panel-${MAX_LIVE_TERMINALS - 4}`;
     fill(manager, MAX_LIVE_TERMINALS, (i) => (i === MAX_LIVE_TERMINALS - 1 ? { isVisible: true } : {}));
     stubAgentStates(manager, { [working]: 'working', [blocked]: 'blocked' });
-    manager.setActiveSession(`session-${MAX_LIVE_TERMINALS - 4}`);
 
     manager.suspendIdleTerminals(NOW);
 
     expect(manager.terminals.has(visible)).toBe(true);
     expect(manager.terminals.has(working)).toBe(true);
     expect(manager.terminals.has(blocked)).toBe(true);
-    expect(manager.terminals.has(active)).toBe(true);
     // The longest-idle candidate that clears every guard.
-    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 5}`)).toBe(false);
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 4}`)).toBe(false);
+  });
+
+  it('spares every hidden sibling in the session last seen on screen', () => {
+    // The real shape the guard exists for: inactive terminal tabs stay mounted
+    // behind display:none, so they report hidden while the user is looking at
+    // that pane. In batterySaver mode a window blur hides even the front tab.
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS, (i) => (
+      i >= MAX_LIVE_TERMINALS - 3 ? { sessionId: 'on-screen' } : {}
+    ));
+    stubAgentStates(manager);
+    // The user looks at the pane, then the window loses focus and every one of
+    // its terminals reports hidden.
+    manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, true);
+    manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, false);
+
+    manager.suspendIdleTerminals(NOW);
+
+    for (let i = MAX_LIVE_TERMINALS - 3; i < MAX_LIVE_TERMINALS; i++) {
+      expect(manager.terminals.has(`panel-${i}`)).toBe(true);
+    }
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 4}`)).toBe(false);
   });
 
   it('never suspends a panel whose agent status has not published yet', () => {
@@ -1136,7 +1155,7 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('none suspendable'));
   });
 
-  it('marks a suspended CLI panel interrupted so its next launch resumes', () => {
+  it('marks a suspended CLI panel interrupted so its next launch resumes', async () => {
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
     fill(manager, MAX_LIVE_TERMINALS);
     stubAgentStates(manager);
@@ -1151,6 +1170,34 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
 
     // Codex and Cursor resume only when this is set; without it they restart empty.
     expect(panelState.customState).toMatchObject({ wasInterrupted: true, agentType: 'codex' });
+    // And it has to reach the panel store, not just the in-memory panel.
+    // `destroyTerminal` starts that save without awaiting it.
+    await vi.waitFor(() => expect(panelManager.updatePanel).toHaveBeenCalled());
+    expect(panelManager.updatePanel).toHaveBeenCalledWith(
+      oldest,
+      expect.objectContaining({
+        state: expect.objectContaining({
+          customState: expect.objectContaining({ wasInterrupted: true, agentType: 'codex' }),
+        }),
+      }),
+    );
+  });
+
+  it('does not mark a plain shell interrupted', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS);
+    stubAgentStates(manager);
+    const oldest = `panel-${MAX_LIVE_TERMINALS - 1}`;
+    const panelState = { customState: { initialCommand: 'npm run dev' } };
+    vi.mocked(panelManager.getPanel).mockImplementation((panelId: string) => (
+      // SAFETY: markPanelInterrupted reads only `state.customState` off the panel.
+      panelId === oldest ? ({ id: oldest, state: panelState } as ReturnType<typeof panelManager.getPanel>) : undefined
+    ));
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.has(oldest)).toBe(false);
+    expect(panelState.customState).not.toHaveProperty('wasInterrupted');
   });
 
   it('still releases a terminal whose final output flush throws', () => {

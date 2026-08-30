@@ -54,7 +54,7 @@ const SHELL_PROMPT_FALLBACK_MS = 5000;
 // practice; the cap is a backstop against pathological payloads.
 const MAX_RESTORE_PAYLOAD_SIZE = 512 * 1024;
 
-import { CliAgentType, isCliAgentType, resolveAgentTypeFromCommand } from './agents/agentIdentity';
+import { CliAgentType, resolveAgentTypeFromCommand } from './agents/agentIdentity';
 import { buildCursorLaunchCommand, createCursorReadyDetector, extractCursorChatId } from './agents/cursorLaunch';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -240,8 +240,19 @@ export class TerminalPanelManager {
   private terminals = new Map<string, TerminalProcess>();
   private serializedBuffers = new Map<string, string>();
   private readonly visibleViewersByPanel = new Map<string, Map<string, number>>();
-  /** Session the user is looking at; never a suspension candidate. */
-  private activeSessionId: string | null = null;
+  /**
+   * Session that most recently had a visible terminal — the one on screen.
+   * Never a suspension candidate.
+   *
+   * Derived rather than pushed. The renderer's active-session hint is written
+   * from two places in `sessionStore` and only one of them notifies main
+   * (`addSession` sets it locally), so a pushed value can point at the previous
+   * session for the rest of the run, and the Remote PWA never sends it at all.
+   * Visibility is a signal this manager already owns and every client drives,
+   * and unlike `isVisible` it survives a window blur in `batterySaver` mode,
+   * which is what makes it usable as the "don't touch this pane" guard.
+   */
+  private lastVisibleSessionId: string | null = null;
   private readonly MAX_SCROLLBACK_LINES = 10000;
   private analyticsManager: AnalyticsManager | null = null;
 
@@ -596,18 +607,6 @@ export class TerminalPanelManager {
   }
 
   /**
-   * Record which session the user is currently looking at.
-   *
-   * Suspension needs a signal that survives the window losing focus. In
-   * `batterySaver` power mode a blur marks every terminal hidden
-   * (`TerminalPanel.tsx`), so `isVisible` alone would make the pane on screen a
-   * candidate. The active session never changes on blur.
-   */
-  setActiveSession(sessionId: string | null): void {
-    this.activeSessionId = sessionId;
-  }
-
-  /**
    * Reclaim PTY slots so `MAX_LIVE_TERMINALS` holds.
    *
    * Every other budget in this class counts bytes — scrollback, the alternate
@@ -621,15 +620,16 @@ export class TerminalPanelManager {
    * exist so it can never do the one thing a restart does do — kill an agent
    * mid-turn. A candidate must be all of:
    *
-   * - not in the session the user is looking at, so a blurred window in
-   *   `batterySaver` mode cannot make the visible pane a target;
-   * - hidden, i.e. mounted in no renderer;
+   * - not in `lastVisibleSessionId`, so a blurred window in `batterySaver` mode
+   *   cannot make the pane on screen a target. Only that session's panels stay
+   *   mounted in the renderer, so this is also what keeps suspension off any
+   *   panel a component is still holding;
+   * - hidden;
    * - settled to `idle` by the status monitor. Note this is `=== 'idle'`, not
    *   `!== 'working'`: every panel is registered (see
-   *   `registerAgentStatusPanel`), and `getState` returns `undefined` both
-   *   before the first publish and while an agent-owned viewer holds the state
-   *   (`AgentStatusMonitor.update` early-returns on `skipStateUpdate`), so
-   *   `undefined` is "unknown", never "no agent here";
+   *   `registerAgentStatusPanel`), so `getState` returning `undefined` means
+   *   "has not published yet" — true of an agent that has only just launched —
+   *   never "no agent here";
    * - quiet for `TERMINAL_IDLE_SUSPEND_MS`. `lastActivity` only advances on PTY
    *   bytes, so a genuinely silent agent rests on its manifest publishing
    *   `working`; the idle window is the backstop for that.
@@ -643,7 +643,7 @@ export class TerminalPanelManager {
     const candidates: Array<{ panelId: string; idleMs: number }> = [];
     for (const [panelId, terminal] of this.terminals) {
       if (terminal.isVisible) continue;
-      if (this.activeSessionId !== null && terminal.sessionId === this.activeSessionId) continue;
+      if (terminal.sessionId === this.lastVisibleSessionId) continue;
       if (this.agentStatusMonitor.getState(panelId) !== 'idle') continue;
       const idleMs = now - terminal.lastActivity.getTime();
       if (idleMs < TERMINAL_IDLE_SUSPEND_MS) continue;
@@ -694,7 +694,7 @@ export class TerminalPanelManager {
     const agentType = terminal.agentType
       ?? customState.agentType
       ?? resolveAgentTypeFromCommand(customState.initialCommand);
-    if (!isCliAgentType(agentType)) return;
+    if (agentType === undefined) return;
 
     panel.state.customState = { ...customState, wasInterrupted: true, agentType };
   }
@@ -963,6 +963,11 @@ export class TerminalPanelManager {
   }
 
   private applyVisibilityState(terminal: TerminalProcess, isVisible: boolean): void {
+    if (isVisible) {
+      // Recorded before the no-op early return so repeated visible reports keep
+      // the pane on screen pinned, not just the transition into it.
+      this.lastVisibleSessionId = terminal.sessionId;
+    }
     const wasVisible = terminal.isVisible;
     terminal.isVisible = isVisible;
     if (wasVisible === isVisible) return;
@@ -1419,13 +1424,16 @@ export class TerminalPanelManager {
     
     // Handle terminal exit
     terminal.pty.onExit((exitCode: { exitCode: number; signal?: number }) => {
-      // Identity guard: this closure outlives its PTY. `destroyTerminal`
-      // (suspension, panel delete, archive) removes the entry and kills the
-      // process, but a late callback can still arrive — for WSL the kill is
-      // deferred 500ms, and under ptyHost the exit round-trips a UtilityProcess.
-      // By then the panel may hold a freshly spawned terminal, and acting on
-      // `terminal.panelId` would hit that live one instead.
-      if (this.terminals.get(terminal.panelId) !== terminal) return;
+      // Identity guard: this closure outlives its PTY. `destroyTerminal` removes
+      // the entry before the exit lands — for WSL the kill is deferred 500ms,
+      // and under ptyHost the exit round-trips a UtilityProcess — so by then the
+      // panel may already hold a freshly spawned terminal, and acting on
+      // `terminal.panelId` would unregister and delete that live one.
+      //
+      // An absent entry is our own teardown and must still be reported: the
+      // renderer only learns a terminal died from `terminal:exited`.
+      const currentOnExit = this.terminals.get(terminal.panelId);
+      if (currentOnExit !== undefined && currentOnExit !== terminal) return;
 
       // A finished agent is "done": settle its status to idle and stop tracking.
       if (this.agentStatusMonitor.isTracked(terminal.panelId)) {
@@ -1906,38 +1914,47 @@ export class TerminalPanelManager {
       terminal.outputFlushTimer = null;
     }
     disposeFlowControlRecord(terminal.flowControl);
-    try {
-      // The event-sink fanout rethrows the first subscriber error, so one
-      // destroyed webContents or one bad daemon client can throw here. That
-      // must not strand the terminal in `this.terminals` with its PTY already
-      // half torn down — suspension would then re-select it on every pass.
-      this.flushOutputBuffer(terminal);
-    } catch (error) {
-      console.warn(`[TerminalPanelManager] Final output flush failed for ${panelId}:`, error);
-    }
-    terminal.screenEmulator?.dispose();
 
-    // Kill the PTY process
+    // Each step is isolated, and the removals run under `finally`.
+    // The event-sink fanout rethrows its first subscriber error and `dispose()`
+    // serializes through a third-party addon, so either can throw. Sharing one
+    // `try` would let a bad subscriber skip `pty.kill()` — leaking the very
+    // process this exists to reclaim — and a throw that skipped the removals
+    // would strand a half-destroyed terminal that suspension re-selects on
+    // every later pass.
     try {
-      if (terminal.isWSL) {
-        terminal.pty.write('exit\r');
-        // Give WSL a moment to gracefully exit
-        setTimeout(() => {
-          try { terminal.pty.kill(); } catch { /* already exited */ }
-        }, 500);
-      } else {
-        terminal.pty.kill();
+      try {
+        this.flushOutputBuffer(terminal);
+      } catch (error) {
+        console.warn(`[TerminalPanelManager] Final output flush failed for ${panelId}:`, error);
       }
-    } catch (error) {
-      console.error(`[TerminalPanelManager] Error killing terminal ${panelId}:`, error);
-    }
 
-    // Remove from maps
-    this.terminals.delete(panelId);
-    this.visibleViewersByPanel.delete(panelId);
-    this.serializedBuffers.delete(panelId);
-    this.agentStatusMonitor.unregister(panelId);
-    this.maybeStopAgentStatusPoll();
+      try {
+        terminal.screenEmulator?.dispose();
+      } catch (error) {
+        console.warn(`[TerminalPanelManager] Emulator dispose failed for ${panelId}:`, error);
+      }
+
+      try {
+        if (terminal.isWSL) {
+          terminal.pty.write('exit\r');
+          // Give WSL a moment to gracefully exit
+          setTimeout(() => {
+            try { terminal.pty.kill(); } catch { /* already exited */ }
+          }, 500);
+        } else {
+          terminal.pty.kill();
+        }
+      } catch (error) {
+        console.error(`[TerminalPanelManager] Error killing terminal ${panelId}:`, error);
+      }
+    } finally {
+      this.terminals.delete(panelId);
+      this.visibleViewersByPanel.delete(panelId);
+      this.serializedBuffers.delete(panelId);
+      this.agentStatusMonitor.unregister(panelId);
+      this.maybeStopAgentStatusPoll();
+    }
   }
 
   /**
