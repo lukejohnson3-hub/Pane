@@ -610,6 +610,20 @@ export class TerminalPanelManager {
     return result;
   }
 
+  private noteSessionVisible(sessionId: string): void {
+    const now = Date.now();
+    this.sessionLastVisibleAt.set(sessionId, now);
+    // Bounded: drop sessions that can no longer pin anything.
+    for (const [id, seenAt] of this.sessionLastVisibleAt) {
+      if (now - seenAt >= TERMINAL_IDLE_SUSPEND_MS) this.sessionLastVisibleAt.delete(id);
+    }
+  }
+
+  private isSessionRecentlyVisible(sessionId: string, now: number): boolean {
+    const seenAt = this.sessionLastVisibleAt.get(sessionId);
+    return seenAt !== undefined && now - seenAt < TERMINAL_IDLE_SUSPEND_MS;
+  }
+
   /**
    * Reclaim PTY slots so `MAX_LIVE_TERMINALS` holds.
    *
@@ -643,20 +657,6 @@ export class TerminalPanelManager {
    * Fails open: if nothing qualifies the new terminal still spawns, because
    * refusing to open a terminal is worse than exceeding the ceiling.
    */
-  private noteSessionVisible(sessionId: string): void {
-    const now = Date.now();
-    this.sessionLastVisibleAt.set(sessionId, now);
-    // Bounded: drop sessions that can no longer pin anything.
-    for (const [id, seenAt] of this.sessionLastVisibleAt) {
-      if (now - seenAt >= TERMINAL_IDLE_SUSPEND_MS) this.sessionLastVisibleAt.delete(id);
-    }
-  }
-
-  private isSessionRecentlyVisible(sessionId: string, now: number): boolean {
-    const seenAt = this.sessionLastVisibleAt.get(sessionId);
-    return seenAt !== undefined && now - seenAt < TERMINAL_IDLE_SUSPEND_MS;
-  }
-
   private suspendIdleTerminals(now: number = Date.now()): void {
     if (this.terminals.size < MAX_LIVE_TERMINALS) return;
 
@@ -2191,19 +2191,37 @@ export class TerminalPanelManager {
 
   destroyAllTerminals(): void {
     for (const [panelId, terminal] of this.terminals) {
+      // Save state before killing. Not awaited; see `destroyTerminal`.
+      this.saveTerminalState(panelId).catch((error) => {
+        console.error(`[TerminalPanelManager] Failed to save state for ${panelId}:`, error);
+      });
+
+      // Clear timers
+      if (terminal.outputFlushTimer) {
+        clearTimeout(terminal.outputFlushTimer);
+        terminal.outputFlushTimer = null;
+      }
+      disposeFlowControlRecord(terminal.flowControl);
+
+      // Isolated exactly as in `destroyTerminal`, and for the same reason: the
+      // event-sink fanout rethrows its first subscriber error and `dispose()`
+      // serializes through a third-party addon. Sharing one `try` would let a
+      // bad subscriber skip `pty.kill()` — and `this.terminals.clear()` below
+      // then drops the last handle to that PTY, orphaning a shell on the quit
+      // path with nothing left able to reclaim it.
       try {
-        // Save state before killing
-        this.saveTerminalState(panelId);
-
-        // Clear timers
-        if (terminal.outputFlushTimer) {
-          clearTimeout(terminal.outputFlushTimer);
-          terminal.outputFlushTimer = null;
-        }
-        disposeFlowControlRecord(terminal.flowControl);
         this.flushOutputBuffer(terminal);
-        terminal.screenEmulator?.dispose();
+      } catch (error) {
+        console.warn(`[TerminalPanelManager] Final output flush failed for ${panelId}:`, error);
+      }
 
+      try {
+        terminal.screenEmulator?.dispose();
+      } catch (error) {
+        console.warn(`[TerminalPanelManager] Emulator dispose failed for ${panelId}:`, error);
+      }
+
+      try {
         terminal.pty.kill();
       } catch (error) {
         console.error(`[TerminalPanelManager] Error killing terminal ${panelId}:`, error);
@@ -2213,6 +2231,7 @@ export class TerminalPanelManager {
     this.terminals.clear();
     this.visibleViewersByPanel.clear();
     this.serializedBuffers.clear();
+    this.sessionLastVisibleAt.clear();
   }
 
   getActiveTerminals(): string[] {

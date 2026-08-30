@@ -1026,6 +1026,7 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     vi.mocked(panelManager.getPanel).mockReset();
     vi.mocked(panelManager.updatePanel).mockReset();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   /**
@@ -1207,9 +1208,13 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     // Viewers are plural: the Remote PWA re-asserts visibility on a heartbeat.
     // A single global pin would be overwritten by whoever reported last.
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    fill(manager, MAX_LIVE_TERMINALS, (i) => (
-      i >= MAX_LIVE_TERMINALS - 2 ? { sessionId: 'desktop' } : { sessionId: 'remote' }
-    ));
+    // Two pinned sessions and a pool of unpinned ones, so a pass that spares
+    // everything cannot be mistaken for the guard working.
+    fill(manager, MAX_LIVE_TERMINALS, (i) => {
+      if (i >= MAX_LIVE_TERMINALS - 2) return { sessionId: 'desktop' };
+      if (i === 0) return { sessionId: 'remote' };
+      return {};
+    });
     stubAgentStates(manager);
     // Desktop is on its pane, then the window blurs and its terminals hide.
     manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, true, 'local:legacy');
@@ -1219,9 +1224,14 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
 
     manager.suspendIdleTerminals(NOW);
 
-    // The desktop pane must survive the remote viewer's heartbeat.
+    // The desktop pane must survive the remote viewer's heartbeat...
     expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 1}`)).toBe(true);
     expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 2}`)).toBe(true);
+    // ...and the remote's own session too...
+    expect(manager.terminals.has('panel-0')).toBe(true);
+    // ...while an unpinned terminal is still actually reclaimed, so this cannot
+    // pass by sparing everything.
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 3}`)).toBe(false);
   });
 
   it('arms the deferred kill for a WSL terminal even when the exit write throws', () => {
