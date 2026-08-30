@@ -54,7 +54,6 @@ type VisibilityAccess = {
   terminals: Map<string, TerminalUnderTest>;
   setVisibility(panelId: string, isVisible: boolean, viewerId?: string): void;
   clearVisibilityViewersByPrefix(prefix: string): void;
-  pruneVisibilityViewersByPrefix(prefix: string, staleAfterMs: number): void;
 };
 
 type SnapshotAccess = {
@@ -117,7 +116,10 @@ type ShellPromptSchedulerAccess = {
 function testAccess<Access>(manager: TerminalPanelManager): Access {
   // SAFETY: Each access type above mirrors the exact members exercised by its
   // tests, private ones included; this helper keeps that test-only seam in one
-  // place.
+  // place. Note the cast is to an unconstrained type parameter, so the compiler
+  // checks nothing here — a renamed member survives `tsc` and surfaces as a
+  // runtime TypeError instead. Loud, but not caught early: keep these types
+  // honest by hand.
   return manager as Access;
 }
 
@@ -1317,13 +1319,30 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     manager.setVisibility('panel-0', true, 'daemon:remote-1');
     expect(manager.sessionLastVisibleAt.has('watched')).toBe(true);
 
-    // Age the pin as it would be after a quiet fifteen minutes.
+    // Age the pin as it would be after a quiet fifteen minutes, and strand a
+    // second session nobody is watching any more.
     manager.sessionLastVisibleAt.set('watched', Date.now() - TERMINAL_IDLE_SUSPEND_MS - 1000);
+    manager.sessionLastVisibleAt.set('abandoned', Date.now() - TERMINAL_IDLE_SUSPEND_MS - 1000);
     // The heartbeat: already visible, so the transition check short-circuits.
     manager.setVisibility('panel-0', true, 'daemon:remote-1');
 
     const seenAt = manager.sessionLastVisibleAt.get('watched') ?? 0;
     expect(Date.now() - seenAt).toBeLessThan(TERMINAL_IDLE_SUSPEND_MS);
+    // The prune on write is the only bound on this map; without it a session id
+    // is retained for every pane ever viewed.
+    expect(manager.sessionLastVisibleAt.has('abandoned')).toBe(false);
+  });
+
+  it('does not pin a session when a terminal reports hidden', () => {
+    // The `if (isVisible)` guard on the pin. Without it, going hidden would pin
+    // the session for the full window at the exact moment nobody is watching
+    // it — exempting every terminal in that session from the ceiling.
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, 1, () => ({ sessionId: 'watched' }));
+
+    manager.setVisibility('panel-0', false, 'local:legacy');
+
+    expect(manager.sessionLastVisibleAt.has('watched')).toBe(false);
   });
 
   it('still releases a terminal whose final output flush throws', () => {
