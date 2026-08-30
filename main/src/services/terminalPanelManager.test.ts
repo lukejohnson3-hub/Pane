@@ -20,6 +20,7 @@ type TerminalUnderTest = {
     resume: ReturnType<typeof vi.fn>;
     resize: ReturnType<typeof vi.fn>;
     write: ReturnType<typeof vi.fn>;
+    kill: ReturnType<typeof vi.fn>;
   };
   isPtyHost: boolean;
   panelId: string;
@@ -93,6 +94,12 @@ type AgentSessionCaptureAccess = {
   saveTerminalState(panelId: string): Promise<void>;
 };
 
+type SuspendIdleAccess = {
+  terminals: Map<string, TerminalUnderTest>;
+  agentStatusMonitor: { getState(panelId: string): string | undefined };
+  suspendIdleTerminals(now?: number): void;
+};
+
 type ShellPromptSchedulerAccess = {
   scheduleAfterShellPrompt(ptyProcess: TerminalUnderTest['pty'] & {
     onData(listener: (data: string) => void): { dispose(): void };
@@ -120,6 +127,7 @@ function createTerminal(overrides: Partial<TerminalUnderTest> = {}): TerminalUnd
       resume: vi.fn(),
       resize: vi.fn(),
       write: vi.fn(),
+      kill: vi.fn(),
     },
     isPtyHost: false,
     panelId: 'panel-1',
@@ -1003,5 +1011,84 @@ describe('TerminalPanelManager agent session capture', () => {
       }),
     });
     disposeFlowControlRecord(terminal.flowControl);
+  });
+});
+
+describe('TerminalPanelManager live-terminal ceiling', () => {
+  const CEILING = 32;
+  const IDLE_MS = 15 * 60_000;
+  const NOW = 1_800_000_000_000;
+
+  afterEach(() => {
+    vi.mocked(panelManager.getPanel).mockReset();
+    vi.mocked(panelManager.updatePanel).mockReset();
+  });
+
+  function fill(
+    manager: SuspendIdleAccess,
+    count: number,
+    overridesFor: (index: number) => Partial<TerminalUnderTest> = () => ({}),
+  ): void {
+    for (let i = 0; i < count; i++) {
+      const panelId = `panel-${i}`;
+      manager.terminals.set(panelId, createTerminal({
+        panelId,
+        isVisible: false,
+        lastActivity: new Date(NOW - IDLE_MS - 1000 - i),
+        ...overridesFor(i),
+      }));
+    }
+  }
+
+  it('leaves every terminal alone below the ceiling', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, CEILING - 1);
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.size).toBe(CEILING - 1);
+  });
+
+  it('suspends the longest-idle hidden terminal, and only enough to get back under', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, CEILING);
+
+    manager.suspendIdleTerminals(NOW);
+
+    // panel-31 is the oldest (lastActivity decreases as the index grows).
+    expect(manager.terminals.has('panel-31')).toBe(false);
+    expect(manager.terminals.size).toBe(CEILING - 1);
+  });
+
+  it('never suspends a visible terminal, a live agent turn, or a recently active one', () => {
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, CEILING, (i) => {
+      if (i === CEILING - 1) return { isVisible: true };
+      if (i === CEILING - 2) return { lastActivity: new Date(NOW - 1000) };
+      return {};
+    });
+    vi.spyOn(manager.agentStatusMonitor, 'getState').mockImplementation(
+      (panelId: string) => (panelId === `panel-${CEILING - 3}` ? 'working' : undefined),
+    );
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.has(`panel-${CEILING - 1}`)).toBe(true);
+    expect(manager.terminals.has(`panel-${CEILING - 2}`)).toBe(true);
+    expect(manager.terminals.has(`panel-${CEILING - 3}`)).toBe(true);
+    // The longest-idle candidate that passes every guard.
+    expect(manager.terminals.has(`panel-${CEILING - 4}`)).toBe(false);
+  });
+
+  it('fails open when nothing is suspendable', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, CEILING, () => ({ isVisible: true }));
+
+    manager.suspendIdleTerminals(NOW);
+
+    expect(manager.terminals.size).toBe(CEILING);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('none suspendable'));
+    warn.mockRestore();
   });
 });

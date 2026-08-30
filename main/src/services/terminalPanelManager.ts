@@ -30,6 +30,14 @@ const OUTPUT_BATCH_INTERVAL_HIDDEN = 250; // ms — background / hidden cadence 
 const OUTPUT_BATCH_SIZE = 131072; // 128KB — timer-based flush preferred; size trigger is safety net
 const OUTPUT_BATCH_SIZE_HIDDEN = 80_000; // 80KB — cap hidden flush size to avoid foreground backpressure churn
 const MAX_CONCURRENT_SPAWNS = 3;
+// Ceiling on resident PTYs. A terminal panel spawns its shell the first time it
+// is viewed and only loses it on panel delete or session archive, so a workspace
+// that accumulates panes accumulates shells indefinitely. On Windows each
+// Git-Bash terminal is a three-process chain, and four days of use reached
+// 2,260 `bash.exe` holding 10.3 GB before the machine could not fork.
+const MAX_LIVE_TERMINALS = 32;
+// A hidden terminal must be quiet this long before it is a suspension candidate.
+const TERMINAL_IDLE_SUSPEND_MS = 15 * 60_000;
 const AGENT_STATUS_POLL_MS = 500; // cadence for re-deriving blocked/working/done from the live screen
 const MAX_SCROLLBACK_BUFFER_SIZE = 500_000; // 500KB of normal shell history
 const MAX_ALTERNATE_SCREEN_BUFFER_SIZE = 100_000; // 100KB of recent TUI redraw state
@@ -585,6 +593,56 @@ export class TerminalPanelManager {
     return result;
   }
 
+  /**
+   * Reclaim PTY slots so `MAX_LIVE_TERMINALS` holds.
+   *
+   * Every other budget in this class caps bytes — scrollback, the alternate
+   * screen, the 64MB serialized-snapshot pool — and none caps processes.
+   * `MAX_CONCURRENT_SPAWNS` throttles how fast shells appear, not how many
+   * stay. This is the missing one.
+   *
+   * Suspending a terminal is what Pane already does to every terminal on
+   * restart: save state, kill the PTY, re-initialize lazily on next view. The
+   * guards below exist so it can never do the one thing a restart does do —
+   * kill an agent mid-turn. A panel is a candidate only when no viewer has it
+   * open, it has produced nothing for `TERMINAL_IDLE_SUSPEND_MS`, and either no
+   * agent is tracked on it or that agent has settled to `idle`. `working` and
+   * `blocked` are both live turns and are never touched.
+   *
+   * Fails open: if nothing is evictable the new terminal still spawns, because
+   * refusing to open a terminal is worse than exceeding the ceiling.
+   */
+  private suspendIdleTerminals(now: number = Date.now()): void {
+    if (this.terminals.size < MAX_LIVE_TERMINALS) return;
+
+    const candidates: Array<{ panelId: string; idleMs: number }> = [];
+    for (const [panelId, terminal] of this.terminals) {
+      if (terminal.isVisible) continue;
+      const agentState = this.agentStatusMonitor.getState(panelId);
+      if (agentState !== undefined && agentState !== 'idle') continue;
+      const idleMs = now - terminal.lastActivity.getTime();
+      if (idleMs < TERMINAL_IDLE_SUSPEND_MS) continue;
+      candidates.push({ panelId, idleMs });
+    }
+
+    if (candidates.length === 0) {
+      console.warn(
+        `[TerminalPanelManager] ${this.terminals.size} live terminals at the ${MAX_LIVE_TERMINALS} ceiling, none suspendable (all visible, mid-turn, or active within ${TERMINAL_IDLE_SUSPEND_MS / 60_000}m) — spawning anyway`
+      );
+      return;
+    }
+
+    // Longest-idle first.
+    candidates.sort((a, b) => b.idleMs - a.idleMs);
+    for (const { panelId, idleMs } of candidates) {
+      if (this.terminals.size < MAX_LIVE_TERMINALS) break;
+      console.log(
+        `[TerminalPanelManager] Suspending idle terminal ${panelId} (hidden, quiet ${Math.round(idleMs / 60_000)}m) to stay under the ${MAX_LIVE_TERMINALS}-terminal ceiling`
+      );
+      this.destroyTerminal(panelId);
+    }
+  }
+
   private async acquireSpawnSlot(priority: number = 1): Promise<void> {
     if (this.activeSpawns < MAX_CONCURRENT_SPAWNS) {
       this.activeSpawns++;
@@ -901,6 +959,9 @@ export class TerminalPanelManager {
       this.releaseSpawnSlot();
       return;
     }
+
+    // Bound the resident PTY count before adding one more.
+    this.suspendIdleTerminals();
 
     try {
 
