@@ -38,6 +38,7 @@ type TerminalUnderTest = {
   outputBuffer: string;
   outputFlushTimer: ReturnType<typeof setTimeout> | null;
   isVisible: boolean;
+  isWSL?: boolean;
   isAlternateScreen: boolean;
   inSyncBlock: boolean;
   agentType?: 'claude' | 'codex' | 'cursor';
@@ -1017,7 +1018,9 @@ describe('TerminalPanelManager agent session capture', () => {
 });
 
 describe('TerminalPanelManager live-terminal ceiling', () => {
-  const NOW = 1_800_000_000_000;
+  // Real clock: the session pin is recorded with Date.now() inside
+  // applyVisibilityState, so the assertions have to share that timebase.
+  const NOW = Date.now();
 
   afterEach(() => {
     vi.mocked(panelManager.getPanel).mockReset();
@@ -1198,6 +1201,51 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
 
     expect(manager.terminals.has(oldest)).toBe(false);
     expect(panelState.customState).not.toHaveProperty('wasInterrupted');
+  });
+
+  it('spares a session another viewer is still watching', () => {
+    // Viewers are plural: the Remote PWA re-asserts visibility on a heartbeat.
+    // A single global pin would be overwritten by whoever reported last.
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS, (i) => (
+      i >= MAX_LIVE_TERMINALS - 2 ? { sessionId: 'desktop' } : { sessionId: 'remote' }
+    ));
+    stubAgentStates(manager);
+    // Desktop is on its pane, then the window blurs and its terminals hide.
+    manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, true, 'local:legacy');
+    manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, false, 'local:legacy');
+    // A remote viewer of a different session keeps heartbeating.
+    manager.setVisibility('panel-0', true, 'daemon:remote-1');
+
+    manager.suspendIdleTerminals(NOW);
+
+    // The desktop pane must survive the remote viewer's heartbeat.
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 1}`)).toBe(true);
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 2}`)).toBe(true);
+  });
+
+  it('arms the deferred kill for a WSL terminal even when the exit write throws', () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, MAX_LIVE_TERMINALS, () => ({ isWSL: true }));
+    stubAgentStates(manager);
+    const doomed = manager.terminals.get(`panel-${MAX_LIVE_TERMINALS - 1}`);
+    // pty.write throws on a PTY that is already going away.
+    doomed?.pty.write.mockImplementation(() => { throw new Error('pty gone'); });
+
+    manager.suspendIdleTerminals(NOW);
+
+    // WSL exits on the write first, so the kill is deferred...
+    expect(doomed?.pty.kill).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(600);
+    // ...but it must still be armed, or the process is never reclaimed.
+    expect(doomed?.pty.kill).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('Graceful exit write failed'),
+      expect.anything(),
+    );
+    vi.useRealTimers();
   });
 
   it('still releases a terminal whose final output flush throws', () => {

@@ -30,9 +30,16 @@ The tool panel system consists of several key components:
 3. **Switching**: User switches panels → Previous panel unmounts XTerm → New panel mounts
 4. **Background Operation**: Processes keep running while a panel is hidden, but not forever.
    A terminal is suspended when the resident count reaches `MAX_LIVE_TERMINALS` and it is
-   hidden, outside the active session, settled to `idle`, and quiet for
-   `TERMINAL_IDLE_SUSPEND_MS`. Panel state is saved first and CLI-agent panels are marked
-   `wasInterrupted`, so the next view restores scrollback and resumes the agent
+   hidden, in no session that has shown a terminal within `TERMINAL_IDLE_SUSPEND_MS`,
+   settled to `idle`, and quiet for that same window. Panel state is saved first and
+   CLI-agent panels are marked `wasInterrupted`, so the next view restores scrollback and
+   resumes the agent.
+
+   Known gap: a suspended panel recovers by remounting, and `TerminalPanel` only
+   initializes on mount. In the default `performance` power mode every mounted panel
+   reports visible, so a mounted panel is never suspended. Under `batterySaver` a mounted
+   panel whose session never reported a visible terminal can be suspended and will then
+   show `[Process exited]` until the user leaves the session and returns
 5. **Suspension**: Ceiling reached → State saved → PTY killed → Panel re-initializes on next view
 6. **Deletion**: Panel closed → Process terminated → Database entry removed → UI updated
 

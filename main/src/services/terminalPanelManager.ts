@@ -241,18 +241,22 @@ export class TerminalPanelManager {
   private serializedBuffers = new Map<string, string>();
   private readonly visibleViewersByPanel = new Map<string, Map<string, number>>();
   /**
-   * Session that most recently had a visible terminal — the one on screen.
-   * Never a suspension candidate.
+   * When each session last had a visible terminal. A session seen within
+   * `TERMINAL_IDLE_SUSPEND_MS` is never a suspension candidate.
    *
    * Derived rather than pushed. The renderer's active-session hint is written
    * from two places in `sessionStore` and only one of them notifies main
    * (`addSession` sets it locally), so a pushed value can point at the previous
    * session for the rest of the run, and the Remote PWA never sends it at all.
    * Visibility is a signal this manager already owns and every client drives,
-   * and unlike `isVisible` it survives a window blur in `batterySaver` mode,
-   * which is what makes it usable as the "don't touch this pane" guard.
+   * and unlike `isVisible` it survives a window blur in `batterySaver` mode.
+   *
+   * Per session rather than a single slot, because viewers are plural: the
+   * Remote PWA re-asserts visibility on a heartbeat, so one global slot would
+   * be overwritten by a remote viewer of another session and unpin the pane
+   * the desktop user is actually looking at.
    */
-  private lastVisibleSessionId: string | null = null;
+  private readonly sessionLastVisibleAt = new Map<string, number>();
   private readonly MAX_SCROLLBACK_LINES = 10000;
   private analyticsManager: AnalyticsManager | null = null;
 
@@ -620,10 +624,12 @@ export class TerminalPanelManager {
    * exist so it can never do the one thing a restart does do — kill an agent
    * mid-turn. A candidate must be all of:
    *
-   * - not in `lastVisibleSessionId`, so a blurred window in `batterySaver` mode
-   *   cannot make the pane on screen a target. Only that session's panels stay
-   *   mounted in the renderer, so this is also what keeps suspension off any
-   *   panel a component is still holding;
+   * - in no session that has shown a terminal within the idle window, so a
+   *   blurred window in `batterySaver` mode cannot make the pane on screen a
+   *   target. This is a guard against reclaiming the pane in front of someone,
+   *   not a guarantee that no renderer still holds the panel: a mounted panel
+   *   whose session never reported a visible terminal is still reachable, and
+   *   the renderer has no re-init path for one (see TOOL_PANEL_SYSTEM.md);
    * - hidden;
    * - settled to `idle` by the status monitor. Note this is `=== 'idle'`, not
    *   `!== 'working'`: every panel is registered (see
@@ -637,13 +643,27 @@ export class TerminalPanelManager {
    * Fails open: if nothing qualifies the new terminal still spawns, because
    * refusing to open a terminal is worse than exceeding the ceiling.
    */
+  private noteSessionVisible(sessionId: string): void {
+    const now = Date.now();
+    this.sessionLastVisibleAt.set(sessionId, now);
+    // Bounded: drop sessions that can no longer pin anything.
+    for (const [id, seenAt] of this.sessionLastVisibleAt) {
+      if (now - seenAt >= TERMINAL_IDLE_SUSPEND_MS) this.sessionLastVisibleAt.delete(id);
+    }
+  }
+
+  private isSessionRecentlyVisible(sessionId: string, now: number): boolean {
+    const seenAt = this.sessionLastVisibleAt.get(sessionId);
+    return seenAt !== undefined && now - seenAt < TERMINAL_IDLE_SUSPEND_MS;
+  }
+
   private suspendIdleTerminals(now: number = Date.now()): void {
     if (this.terminals.size < MAX_LIVE_TERMINALS) return;
 
     const candidates: Array<{ panelId: string; idleMs: number }> = [];
     for (const [panelId, terminal] of this.terminals) {
       if (terminal.isVisible) continue;
-      if (terminal.sessionId === this.lastVisibleSessionId) continue;
+      if (this.isSessionRecentlyVisible(terminal.sessionId, now)) continue;
       if (this.agentStatusMonitor.getState(panelId) !== 'idle') continue;
       const idleMs = now - terminal.lastActivity.getTime();
       if (idleMs < TERMINAL_IDLE_SUSPEND_MS) continue;
@@ -966,7 +986,7 @@ export class TerminalPanelManager {
     if (isVisible) {
       // Recorded before the no-op early return so repeated visible reports keep
       // the pane on screen pinned, not just the transition into it.
-      this.lastVisibleSessionId = terminal.sessionId;
+      this.noteSessionVisible(terminal.sessionId);
     }
     const wasVisible = terminal.isVisible;
     terminal.isVisible = isVisible;
@@ -1935,18 +1955,27 @@ export class TerminalPanelManager {
         console.warn(`[TerminalPanelManager] Emulator dispose failed for ${panelId}:`, error);
       }
 
-      try {
-        if (terminal.isWSL) {
+      if (terminal.isWSL) {
+        // Arm the kill BEFORE the write. `pty.write` throws on a PTY that is
+        // already going away — `writeToTerminal` wraps it for exactly that
+        // reason — and a throw here used to mean the timer was never scheduled
+        // and the process was never reclaimed, on the platform where the leak
+        // was measured.
+        setTimeout(() => {
+          try { terminal.pty.kill(); } catch { /* already exited */ }
+        }, 500);
+        try {
+          // Give WSL a chance to exit on its own first.
           terminal.pty.write('exit\r');
-          // Give WSL a moment to gracefully exit
-          setTimeout(() => {
-            try { terminal.pty.kill(); } catch { /* already exited */ }
-          }, 500);
-        } else {
-          terminal.pty.kill();
+        } catch (error) {
+          console.warn(`[TerminalPanelManager] Graceful exit write failed for ${panelId}:`, error);
         }
-      } catch (error) {
-        console.error(`[TerminalPanelManager] Error killing terminal ${panelId}:`, error);
+      } else {
+        try {
+          terminal.pty.kill();
+        } catch (error) {
+          console.error(`[TerminalPanelManager] Error killing terminal ${panelId}:`, error);
+        }
       }
     } finally {
       this.terminals.delete(panelId);
