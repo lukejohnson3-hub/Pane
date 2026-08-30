@@ -101,6 +101,9 @@ type SuspendIdleAccess = {
   suspendIdleTerminals(now?: number): void;
   flushOutputBuffer(terminal: TerminalUnderTest): void;
   setVisibility(panelId: string, isVisible: boolean, viewerId?: string): void;
+  destroyAllTerminals(): void;
+  visibleViewersByPanel: Map<string, Map<string, number>>;
+  serializedBuffers: Map<string, string>;
 };
 
 type ShellPromptSchedulerAccess = {
@@ -1208,18 +1211,22 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     // Viewers are plural: the Remote PWA re-asserts visibility on a heartbeat.
     // A single global pin would be overwritten by whoever reported last.
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
-    // Two pinned sessions and a pool of unpinned ones, so a pass that spares
-    // everything cannot be mistaken for the guard working.
+    // Idleness grows with the index, so the terminals a broken pin would take
+    // first are the highest ones. Both pinned sessions therefore own a hidden
+    // terminal up there: desktop has the top two, and remote has the next.
+    // Anything lower could survive a broken pin by luck rather than by guard.
     fill(manager, MAX_LIVE_TERMINALS, (i) => {
       if (i >= MAX_LIVE_TERMINALS - 2) return { sessionId: 'desktop' };
-      if (i === 0) return { sessionId: 'remote' };
+      if (i === MAX_LIVE_TERMINALS - 3 || i === 0) return { sessionId: 'remote' };
       return {};
     });
     stubAgentStates(manager);
     // Desktop is on its pane, then the window blurs and its terminals hide.
     manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, true, 'local:legacy');
     manager.setVisibility(`panel-${MAX_LIVE_TERMINALS - 1}`, false, 'local:legacy');
-    // A remote viewer of a different session keeps heartbeating.
+    // A remote viewer of a different session keeps heartbeating. Only panel-0
+    // is visible; its session-mate higher up is hidden and can be saved by
+    // nothing except the pin.
     manager.setVisibility('panel-0', true, 'daemon:remote-1');
 
     manager.suspendIdleTerminals(NOW);
@@ -1227,11 +1234,11 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     // The desktop pane must survive the remote viewer's heartbeat...
     expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 1}`)).toBe(true);
     expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 2}`)).toBe(true);
-    // ...and the remote's own session too...
-    expect(manager.terminals.has('panel-0')).toBe(true);
+    // ...and so must the remote's hidden terminal, which only the pin protects...
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 3}`)).toBe(true);
     // ...while an unpinned terminal is still actually reclaimed, so this cannot
     // pass by sparing everything.
-    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 3}`)).toBe(false);
+    expect(manager.terminals.has(`panel-${MAX_LIVE_TERMINALS - 4}`)).toBe(false);
   });
 
   it('arms the deferred kill for a WSL terminal even when the exit write throws', () => {
@@ -1256,6 +1263,32 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
       expect.anything(),
     );
     vi.useRealTimers();
+  });
+
+  it('kills every PTY in destroyAllTerminals even when one fails to flush', () => {
+    // The quit path. `this.terminals.clear()` runs straight after the loop, so
+    // a skipped kill leaves nothing able to reclaim that shell.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, 3);
+    const doomed = manager.terminals.get('panel-1');
+    vi.spyOn(manager, 'flushOutputBuffer').mockImplementation((terminal) => {
+      if (terminal.panelId === 'panel-1') throw new Error('event sink exploded');
+    });
+
+    manager.destroyAllTerminals();
+
+    for (const panelId of ['panel-0', 'panel-1', 'panel-2']) {
+      expect(manager.terminals.has(panelId)).toBe(false);
+    }
+    expect(doomed?.pty.kill).toHaveBeenCalled();
+    expect(manager.terminals.size).toBe(0);
+    expect(manager.visibleViewersByPanel.size).toBe(0);
+    expect(manager.serializedBuffers.size).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('Final output flush failed'),
+      expect.anything(),
+    );
   });
 
   it('still releases a terminal whose final output flush throws', () => {

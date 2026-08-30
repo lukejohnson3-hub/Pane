@@ -2203,12 +2203,18 @@ export class TerminalPanelManager {
       }
       disposeFlowControlRecord(terminal.flowControl);
 
-      // Isolated exactly as in `destroyTerminal`, and for the same reason: the
-      // event-sink fanout rethrows its first subscriber error and `dispose()`
-      // serializes through a third-party addon. Sharing one `try` would let a
-      // bad subscriber skip `pty.kill()` — and `this.terminals.clear()` below
-      // then drops the last handle to that PTY, orphaning a shell on the quit
-      // path with nothing left able to reclaim it.
+      // The flush/dispose/kill triple is isolated as in `destroyTerminal`, and
+      // for the same reason: the event-sink fanout rethrows its first
+      // subscriber error and `dispose()` serializes through a third-party
+      // addon. Sharing one `try` would let a bad subscriber skip `pty.kill()`
+      // — and `this.terminals.clear()` below then drops the last handle to
+      // that PTY, orphaning a shell on the quit path with nothing left able to
+      // reclaim it.
+      //
+      // Unlike `destroyTerminal`, WSL terminals are killed outright rather than
+      // written `exit\r` with the kill deferred 500ms. That is deliberate: the
+      // quit sequence may exit before a deferred timer fires, and
+      // `sendCtrlCToAll` has already given every terminal 2.2s to leave.
       try {
         this.flushOutputBuffer(terminal);
       } catch (error) {
