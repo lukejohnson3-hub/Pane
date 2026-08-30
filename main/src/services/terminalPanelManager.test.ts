@@ -102,8 +102,10 @@ type SuspendIdleAccess = {
   flushOutputBuffer(terminal: TerminalUnderTest): void;
   setVisibility(panelId: string, isVisible: boolean, viewerId?: string): void;
   destroyAllTerminals(): void;
+  saveSerializedSnapshot(panelId: string, serializedData: string): void;
   visibleViewersByPanel: Map<string, Map<string, number>>;
   serializedBuffers: Map<string, string>;
+  sessionLastVisibleAt: Map<string, number>;
 };
 
 type ShellPromptSchedulerAccess = {
@@ -113,8 +115,9 @@ type ShellPromptSchedulerAccess = {
 };
 
 function testAccess<Access>(manager: TerminalPanelManager): Access {
-  // SAFETY: Each access type above mirrors the exact private members exercised
-  // by its tests; this helper keeps that deliberate test-only seam in one place.
+  // SAFETY: Each access type above mirrors the exact members exercised by its
+  // tests, private ones included; this helper keeps that test-only seam in one
+  // place.
   return manager as Access;
 }
 
@@ -1271,24 +1274,56 @@ describe('TerminalPanelManager live-terminal ceiling', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
     fill(manager, 3);
-    const doomed = manager.terminals.get('panel-1');
+    const terminals = ['panel-0', 'panel-1', 'panel-2'].map(id => manager.terminals.get(id));
+    // Populate the maps the assertions below check. Without this they pass even
+    // with the production `clear()` calls deleted, because nothing ever filled
+    // them.
+    manager.setVisibility('panel-0', true, 'local:legacy');
+    manager.saveSerializedSnapshot('panel-2', 'serialized');
+    expect(manager.visibleViewersByPanel.size).toBe(1);
+    expect(manager.serializedBuffers.size).toBe(1);
+    expect(manager.sessionLastVisibleAt.size).toBe(1);
+
     vi.spyOn(manager, 'flushOutputBuffer').mockImplementation((terminal) => {
       if (terminal.panelId === 'panel-1') throw new Error('event sink exploded');
     });
 
     manager.destroyAllTerminals();
 
-    for (const panelId of ['panel-0', 'panel-1', 'panel-2']) {
-      expect(manager.terminals.has(panelId)).toBe(false);
+    // Every PTY, not just the one that threw: a shared `try` would cost the
+    // throwing panel its kill, and an escaped throw would cost every later one.
+    for (const terminal of terminals) {
+      expect(terminal?.pty.kill).toHaveBeenCalled();
     }
-    expect(doomed?.pty.kill).toHaveBeenCalled();
     expect(manager.terminals.size).toBe(0);
     expect(manager.visibleViewersByPanel.size).toBe(0);
     expect(manager.serializedBuffers.size).toBe(0);
+    expect(manager.sessionLastVisibleAt.size).toBe(0);
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('Final output flush failed'),
       expect.anything(),
     );
+  });
+
+  it('re-pins a session on every visible report, not only on the transition', () => {
+    // `noteSessionVisible` sits above `applyVisibilityState`'s no-op early
+    // return. Moving it below would compile and pass every other test, while
+    // silently breaking the Remote PWA: its heartbeat re-asserts visibility
+    // without a transition, so a watched session would pin once and then expire
+    // under an active viewer.
+    const manager = testAccess<SuspendIdleAccess>(new TerminalPanelManager());
+    fill(manager, 1, () => ({ sessionId: 'watched' }));
+
+    manager.setVisibility('panel-0', true, 'daemon:remote-1');
+    expect(manager.sessionLastVisibleAt.has('watched')).toBe(true);
+
+    // Age the pin as it would be after a quiet fifteen minutes.
+    manager.sessionLastVisibleAt.set('watched', Date.now() - TERMINAL_IDLE_SUSPEND_MS - 1000);
+    // The heartbeat: already visible, so the transition check short-circuits.
+    manager.setVisibility('panel-0', true, 'daemon:remote-1');
+
+    const seenAt = manager.sessionLastVisibleAt.get('watched') ?? 0;
+    expect(Date.now() - seenAt).toBeLessThan(TERMINAL_IDLE_SUSPEND_MS);
   });
 
   it('still releases a terminal whose final output flush throws', () => {
